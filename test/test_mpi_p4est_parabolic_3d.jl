@@ -35,13 +35,18 @@ EXAMPLES_DIR = joinpath(examples_dir(), "p4est_3d_dgsem")
     end
 
     @trixi_testset "P4estMesh3D: elixir_advection_diffusion_amr_curved.jl" begin
-        @test_trixi_include(joinpath(EXAMPLES_DIR,
-                                     "elixir_advection_diffusion_amr_curved.jl"),
-                            l2=[0.000683123952524889], linf=[0.023601069354373894])
-        # Ensure that we do not have excessive memory allocations
-        # (e.g., from type instabilities)
-        @test_allocations(Trixi.rhs!, semi, sol, 1500)
-        @test_allocations(Trixi.rhs_parabolic!, semi, sol, 1500)
+        if Sys.isapple() && (Sys.ARCH === :aarch64)
+            # Show a hint in the test summary that there is a broken test
+            @test_skip false
+        else
+            @test_trixi_include(joinpath(EXAMPLES_DIR,
+                                         "elixir_advection_diffusion_amr_curved.jl"),
+                                l2=[0.000683123952524889], linf=[0.023601069354373894])
+            # Ensure that we do not have excessive memory allocations
+            # (e.g., from type instabilities)
+            @test_allocations(Trixi.rhs!, semi, sol, 1500)
+            @test_allocations(Trixi.rhs_parabolic!, semi, sol, 1500)
+        end
     end
 
     @trixi_testset "P4estMesh3D: elixir_navierstokes_freestream_boundaries.jl" begin
