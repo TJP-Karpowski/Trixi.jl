@@ -42,9 +42,9 @@
 # vectorize.
 
 """
-    VolumeIntegralMacroCellFV(; moment_inversion, reconstruction,
-                                             surface_flux, center2recon, face2flux,
-                                             initial_condition_nodes)
+    VolumeIntegralMacroCellFV(; moment_inversion, reconstruction, schemes,
+                                surface_flux, surface_gradient, center2recon, face2flux,
+                                initial_condition_nodes)
 
 Volume integral of the [`MacroCellFV`](@ref) solver. It collects the components of the
 scheme; construct the solver with [`MacroCellFV`](@ref) instead of using this type
@@ -53,59 +53,125 @@ directly.
 !!! warning "Experimental code"
     This code is experimental and may change in any future release.
 """
-struct VolumeIntegralMacroCellFV{MomentInversion, Reconstruction,
-                                 SurfaceFlux, Center2Recon, Face2Flux} <:
+struct VolumeIntegralMacroCellFV{MomentInversion, Reconstruction, Schemes,
+                                 SurfaceFlux, SurfaceGradient, Center2Recon,
+                                 Face2Flux} <:
        AbstractVolumeIntegral
     moment_inversion::MomentInversion
+    # The scheme of all reconstruction variables if `schemes === nothing`
     reconstruction::Reconstruction
+    # One scheme per reconstruction variable (a tuple) or `nothing`
+    schemes::Schemes
     surface_flux::SurfaceFlux
+    surface_gradient::SurfaceGradient
     center2recon::Center2Recon
     face2flux::Face2Flux
     # Gauss-Legendre nodes per direction for the cell averages of the initial
     # condition (1: point value at the subcell center)
     initial_condition_nodes::Int
+    # Stencil factor of the diffusive time step (see `diffusion_dt_factor`)
+    diffusion_dt_factor::Float64
 end
 
 function VolumeIntegralMacroCellFV(;
                                    moment_inversion = MomentInversionIdentity(),
-                                   reconstruction = ReconstructionMUSCL(),
+                                   reconstruction = nothing,
+                                   schemes = nothing,
                                    surface_flux,
+                                   surface_gradient = gradient_sum,
                                    center2recon = cons2cons,
                                    face2flux = cons2cons,
                                    initial_condition_nodes = 1)
     initial_condition_nodes >= 1 ||
         throw(ArgumentError("`initial_condition_nodes` must be at least 1"))
-    reconstruction = point_reconstruction(moment_inversion, reconstruction)
-    return VolumeIntegralMacroCellFV(moment_inversion, reconstruction,
-                                     surface_flux, center2recon, face2flux,
-                                     Int(initial_condition_nodes))
+    if schemes === nothing
+        reconstruction = reconstruction === nothing ? ReconstructionMUSCL() :
+                         reconstruction
+        reconstruction = point_reconstruction(moment_inversion, reconstruction)
+    else
+        reconstruction === nothing ||
+            throw(ArgumentError("give either `reconstruction` (the same scheme for " *
+                                "all reconstruction variables) or `schemes` (one " *
+                                "scheme per reconstruction variable)"))
+        schemes isa Tuple && !isempty(schemes) ||
+            throw(ArgumentError("`schemes` must be a non-empty tuple"))
+        schemes = map(scheme -> point_reconstruction(moment_inversion, scheme),
+                      schemes)
+    end
+    all_schemes = schemes === nothing ? (reconstruction,) : schemes
+    dt_factor = maximum(scheme -> diffusion_dt_factor(scheme, moment_inversion),
+                        all_schemes)
+    return VolumeIntegralMacroCellFV(moment_inversion, reconstruction, schemes,
+                                     surface_flux, surface_gradient, center2recon,
+                                     face2flux, Int(initial_condition_nodes),
+                                     Float64(dt_factor))
 end
 
 function Base.show(io::IO, ::MIME"text/plain",
                    integral::VolumeIntegralMacroCellFV)
     @nospecialize integral
-    setup = ["moment inversion" => integral.moment_inversion,
-        "reconstruction" => integral.reconstruction,
-        "surface flux" => integral.surface_flux,
-        "reconstruction variables" => integral.center2recon,
-        "flux variables" => integral.face2flux]
+    setup = Pair{String, Any}["moment inversion" => integral.moment_inversion]
+    if integral.schemes === nothing
+        push!(setup, "reconstruction" => integral.reconstruction)
+    else
+        for (v, scheme) in enumerate(integral.schemes)
+            push!(setup, "scheme of variable $v" => scheme)
+        end
+    end
+    append!(setup,
+            ["surface flux" => integral.surface_flux,
+                "reconstruction variables" => integral.center2recon,
+                "flux variables" => integral.face2flux])
+    if has_gradients(integral) isa True
+        push!(setup, "surface gradient" => integral.surface_gradient)
+    end
     summary_box(io, "VolumeIntegralMacroCellFV", setup)
 end
+
+"""
+    gradient_sum(d_left, d_right)
+
+Derivative at a subcell face of [`MacroCellFV`](@ref) from the contributions of the
+subcells on its left and right sides (the halves of a central stencil, see
+[`GradientCentral`](@ref)): their sum.
+
+!!! warning "Experimental code"
+    This code is experimental and may change in any future release.
+"""
+@inline gradient_sum(d_left, d_right) = d_left + d_right
 
 # Halo width: the moment inversion is applied to the halo cells used by the face
 # reconstruction, so the stencil widths add up.
 @inline function nhalo(volume_integral::VolumeIntegralMacroCellFV)
-    @unpack moment_inversion, reconstruction = volume_integral
-    return nhalo(moment_inversion) + nhalo(reconstruction)
+    @unpack moment_inversion, reconstruction, schemes = volume_integral
+    return nhalo(moment_inversion) + nhalo_schemes(reconstruction, schemes)
+end
+@inline nhalo_schemes(reconstruction, ::Nothing) = nhalo(reconstruction)
+@inline nhalo_schemes(reconstruction, schemes::Tuple) = maximum(nhalo, schemes)
+
+# The scheme of the reconstruction variable `v`
+@inline pad_scheme(volume_integral::VolumeIntegralMacroCellFV, v) = pad_scheme(volume_integral.reconstruction,
+                                                                               volume_integral.schemes,
+                                                                               v)
+@inline pad_scheme(reconstruction, ::Nothing, v) = reconstruction
+@inline pad_scheme(reconstruction, schemes::Tuple, v) = schemes[v]
+
+# `True()` if any reconstruction variable has face derivatives (for diffusion)
+@inline function has_gradients(volume_integral::VolumeIntegralMacroCellFV)
+    @unpack reconstruction, schemes = volume_integral
+    schemes === nothing && return has_gradient(reconstruction)
+    return any(scheme -> has_gradient(scheme) isa True, schemes) ? True() : False()
 end
 
 """
     MacroCellFV(; n_cells::Integer,
                   surface_flux,
                   reconstruction = ReconstructionMUSCL(),
+                  schemes = nothing,
                   moment_inversion = MomentInversionIdentity(),
                   center2recon = cons2cons,
                   face2flux = cons2cons,
+                  surface_gradient = gradient_sum,
                   initial_condition_nodes = 1,
                   RealT = Float64)
 
@@ -121,10 +187,17 @@ the number of subcells can also be given as `n_nodes`. Currently supported on th
 - `reconstruction`: [`ReconstructionConstant`](@ref) (first order, `nhalo = 1`),
   [`ReconstructionMUSCL`](@ref) (second order, `nhalo = 2`), or
   [`ReconstructionWENO5JS`](@ref)/[`ReconstructionWENO5Z`](@ref) (fifth order for
-  smooth solutions, `nhalo = 3`). The reconstruction reads the neighboring macro-cells
-  through `nhalo` halo subcells per side, which requires `n_cells >= nhalo`.
+  smooth solutions, `nhalo = 3`), or [`ReconstructionCentral`](@ref) (central face
+  values of even order, `nhalo = order/2`). The reconstruction reads the neighboring
+  macro-cells through `nhalo` halo subcells per side, which requires `n_cells >= nhalo`.
   Orders above two require subcell averages as initial data, see
-  `initial_condition_nodes`.
+  `initial_condition_nodes`. A [`CombinedScheme`](@ref) adds face derivatives for
+  diffusion.
+- `schemes`: instead of `reconstruction`, one scheme per reconstruction variable (a
+  tuple with one entry per output variable of `center2recon`), e.g., a WENO
+  reconstruction of the density and the pressure and a [`CombinedScheme`](@ref) with
+  [`GradientCentral`](@ref) for the velocity and the temperature. Variables without
+  face derivatives cost no derivative work.
 - `moment_inversion`: conversion of the subcell averages to point values at the
   subcell centers before the reconstruction: [`MomentInversionIdentity`](@ref) (the
   averages are used as point values), [`MomentInversionCentral`](@ref) (linear, of even
@@ -137,6 +210,10 @@ the number of subcells can also be given as `n_nodes`. Currently supported on th
   the moment inversion. With `MomentInversionIdentity`, it acts on the subcell
   averages, so a nonlinear transformation is only second-order accurate; with the
   moment inversions to point values, it acts on the point values and keeps the order.
+  The number of reconstruction variables is the length of its output and may differ
+  from the number of conservative variables (e.g., the primitive variables and the
+  temperature for the compressible Navier-Stokes equations, see
+  [`cons2prim_temperature_pressure`](@ref)).
 - `face2flux`: transformation of the reconstructed face values to the variables
   expected by `surface_flux` (conservative variables for most numerical fluxes of
   Trixi.jl, e.g., [`prim2cons`](@ref) after `center2recon = cons2prim`).
@@ -146,6 +223,11 @@ the number of subcells can also be given as `n_nodes`. Currently supported on th
   numerical flux that takes the reconstruction variables directly (e.g.,
   [`flux_hllc_primitive`](@ref) with `center2recon = cons2prim`) can be used with
   `face2flux = cons2cons`, which avoids the conversion at the faces.
+  With diffusion, `face2flux` also selects the state and the gradients of the
+  diffusive flux from the reconstruction variables at the faces (see
+  [`macrocell_face2flux`](@ref)).
+- `surface_gradient`: derivative at a face from the contributions of the subcells on
+  both sides, [`gradient_sum`](@ref) for the central stencils.
 - `initial_condition_nodes`: number of Gauss-Legendre nodes per coordinate direction
   for the subcell averages of the initial condition and of the ghost subcells of
   Dirichlet boundaries. The default `1` uses the value at the subcell center, which is
@@ -153,6 +235,21 @@ the number of subcells can also be given as `n_nodes`. Currently supported on th
 
 With `reconstruction = ReconstructionConstant()`, the right-hand side is identical to
 the one of `BlockFV(; n_nodes = n_cells, surface_flux)`.
+
+**Diffusion.** With a [`SemidiscretizationHyperbolicParabolic`](@ref), the diffusive
+fluxes of the parabolic equations (e.g., [`LaplaceDiffusion1D`](@ref) or
+[`CompressibleNavierStokesDiffusion1D`](@ref) with `GradientVariablesPrimitive`) are
+computed in the same pass over the subcells as the advective fluxes, from the face
+derivatives of the schemes with [`GradientCentral`](@ref): the face flux is the
+numerical flux minus the diffusive flux, `semidiscretize` returns a single (non-split)
+`ODEProblem`, and the time step of the [`StepsizeCallback`](@ref) includes the diffusive
+restriction with `cfl_parabolic > 0`. The state of the diffusive flux at a face is the
+mean of the two reconstructed states (the central value for `ReconstructionCentral`).
+The boundary conditions are imposed by the ghost subcells of the hyperbolic boundary
+conditions; the parabolic boundary conditions must be the same (or both periodic).
+
+**Source terms** are averaged over each subcell with the Gauss-Legendre quadrature of
+`initial_condition_nodes`, with the subcell average as state.
 
 !!! warning "Experimental code"
     This code is experimental and may change in any future release.
@@ -165,10 +262,12 @@ const MacroCellFV = DG{Basis, Mortar, SurfaceIntegral,
 
 function MacroCellFV(; n_cells = nothing, n_nodes = nothing,
                      surface_flux,
-                     reconstruction = ReconstructionMUSCL(),
+                     reconstruction = nothing,
+                     schemes = nothing,
                      moment_inversion = MomentInversionIdentity(),
                      center2recon = cons2cons,
                      face2flux = cons2cons,
+                     surface_gradient = gradient_sum,
                      initial_condition_nodes = 1,
                      RealT = Float64)
     if (n_cells === nothing) == (n_nodes === nothing)
@@ -178,8 +277,9 @@ function MacroCellFV(; n_cells = nothing, n_nodes = nothing,
     n_cells = n_cells === nothing ? n_nodes : n_cells
     basis = UniformFiniteVolumeBasis(RealT, n_cells)
     volume_integral = VolumeIntegralMacroCellFV(; moment_inversion, reconstruction,
-                                                surface_flux, center2recon, face2flux,
-                                                initial_condition_nodes)
+                                                schemes, surface_flux,
+                                                surface_gradient, center2recon,
+                                                face2flux, initial_condition_nodes)
     # The surface integral is not used by the right-hand side, but it keeps the `DG`
     # interface (e.g., for callbacks) intact. As for `BlockFV`, the basis is passed as
     # mortar method.
@@ -197,16 +297,25 @@ end
 
 @inline nhalo(dg::MacroCellFV) = nhalo(dg.volume_integral)
 
-# Number of variables of the pads (the number of variables of the equations for the
-# averages)
+# Number of reconstruction variables: the length of the output of `center2recon`
+# (known from its type, so that the result is a compile-time constant)
+@inline nreconvariables(::typeof(cons2cons), equations) = nvariables(equations)
+@inline function nreconvariables(center2recon, equations)
+    u = SVector(ntuple(_ -> 1.0, Val(nvariables(equations))))
+    return length(center2recon(u, equations))
+end
+@inline function nreconvariables(volume_integral::VolumeIntegralMacroCellFV, equations)
+    return nreconvariables(volume_integral.center2recon, equations)
+end
+
+# Number of variables (columns) of the pads: they hold the conservative variables
+# (after the gather) and the reconstruction variables (after `center2recon`, in place).
+# The point values are stored in a second pad of the same size (see
+# `pad_moment_inversion!`).
 @inline function npadvariables(volume_integral::VolumeIntegralMacroCellFV,
                                equations)
-    return npadvariables(has_point_values(volume_integral.moment_inversion), equations)
+    return max(nvariables(equations), nreconvariables(volume_integral, equations))
 end
-@inline npadvariables(::False, equations) = nvariables(equations)
-# The point values are stored in a second pad of the same size (see
-# `pad_moment_inversion!`)
-@inline npadvariables(::True, equations) = nvariables(equations)
 
 # Same as `wrap_array` for `DGSEM`: with Polyester.jl threading, use a `PtrArray`, which
 # does not allocate (the general fallback for `DG` allocates an array header for each
@@ -245,9 +354,26 @@ function point_reconstruction(::MomentInversionPoint,
     return ReconstructionPointValues(reconstruction)
 end
 
+function point_reconstruction(::MomentInversionPoint,
+                              reconstruction::ReconstructionCentral)
+    return ReconstructionCentral(reconstruction.order; points = true)
+end
+
+function point_reconstruction(inversion::MomentInversionPoint, scheme::CombinedScheme)
+    return CombinedScheme(point_reconstruction(inversion, scheme.reconstruction),
+                          point_gradient(inversion, scheme.gradient))
+end
+
+# The derivative schemes for the point values
+point_gradient(::MomentInversionIdentity, gradient) = gradient
+point_gradient(::MomentInversionPoint, gradient::GradientNone) = gradient
+function point_gradient(::MomentInversionPoint, gradient::GradientCentral)
+    return GradientCentral(gradient.order; points = true)
+end
+
 function point_reconstruction(::MomentInversionPoint, reconstruction)
     throw(ArgumentError("the moment inversions to point values support only the WENO " *
-                        "reconstructions"))
+                        "and the central reconstructions"))
 end
 
 # Numerical flux at a subcell face from the reconstructed states `w_ll` and `w_rr` (in
@@ -260,5 +386,88 @@ end
     u_rr = face2flux(w_rr, equations)
 
     return surface_flux(u_ll, u_rr, orientation, equations)
+end
+
+# Advective-diffusive flux at a subcell face: the numerical flux of the reconstructed
+# states `w_ll`, `w_rr` minus the diffusive flux of the face state `w_face` (the mean of
+# the two states) and the derivatives `dw_face` of the reconstruction variables
+@inline function macrocell_face_flux(w_ll, w_rr, w_face, dw_face, orientation,
+                                     equations, equations_parabolic,
+                                     volume_integral::VolumeIntegralMacroCellFV)
+    @unpack surface_flux, face2flux = volume_integral
+
+    u_ll, u_rr, u_diffusive, gradient = macrocell_face2flux(face2flux, w_ll, w_rr,
+                                                            w_face, dw_face,
+                                                            equations,
+                                                            equations_parabolic)
+    flux_advective = surface_flux(u_ll, u_rr, orientation, equations)
+    flux_diffusive = flux(u_diffusive, (gradient,), orientation, equations_parabolic)
+
+    return flux_advective - flux_diffusive
+end
+
+"""
+    macrocell_face2flux(face2flux, w_ll, w_rr, w_face, dw_face,
+                        equations, equations_parabolic)
+
+Transformation of the reconstruction variables at a subcell face of
+[`MacroCellFV`](@ref) with diffusion: from the reconstructed states `w_ll` and `w_rr`,
+the face state `w_face` (their mean) and the derivatives `dw_face` of the
+reconstruction variables along the face normal (zero for the variables without
+derivatives), return `(u_ll, u_rr, u_diffusive, gradient)`: the states of the numerical
+flux `surface_flux(u_ll, u_rr, orientation, equations)` and the state and the gradient
+of the diffusive flux `flux(u_diffusive, (gradient,), orientation,
+equations_parabolic)` (in the gradient variables of `equations_parabolic`).
+
+The default uses `face2flux(w, equations)` for the states of the numerical flux and the
+reconstruction variables as gradient variables (e.g., the conservative variables of
+[`LaplaceDiffusion1D`](@ref) with `center2recon = face2flux = cons2cons`). Add a method
+for the type of `face2flux` for other variables, see
+[`face2flux_navier_stokes_primitive`](@ref).
+
+!!! warning "Experimental code"
+    This code is experimental and may change in any future release.
+"""
+@inline function macrocell_face2flux(face2flux, w_ll, w_rr, w_face, dw_face, equations,
+                                     equations_parabolic)
+    return face2flux(w_ll, equations), face2flux(w_rr, equations), w_face, dw_face
+end
+
+"""
+    cons2prim_temperature_pressure(u, equations::CompressibleEulerEquations1D)
+
+Conservative variables to the reconstruction variables `(rho, v1, p, p / rho)` of
+[`MacroCellFV`](@ref) for the compressible Navier-Stokes equations: the primitive
+variables and the temperature times the gas constant, `R T = p / rho` (so that the gas
+constant of the parabolic equations is not needed here). Use it with
+`face2flux = face2flux_navier_stokes_primitive` and a numerical flux in primitive
+variables, e.g., [`flux_hllc_primitive`](@ref).
+
+!!! warning "Experimental code"
+    This code is experimental and may change in any future release.
+"""
+@inline function cons2prim_temperature_pressure(u,
+                                                equations::CompressibleEulerEquations1D)
+    rho, v1, p = cons2prim(u, equations)
+    return SVector(rho, v1, p, p / rho)
+end
+
+"""
+    face2flux_navier_stokes_primitive(w, equations)
+
+Face transformation of [`MacroCellFV`](@ref) for the reconstruction variables
+`(rho, v1, p, R T)` of [`cons2prim_temperature_pressure`](@ref): the primitive variables
+`(rho, v1, p)` for a numerical flux in primitive variables (e.g.,
+[`flux_hllc_primitive`](@ref)). With diffusion
+([`CompressibleNavierStokesDiffusion1D`](@ref) with `GradientVariablesPrimitive`), the
+state and the gradient of the diffusive flux are `(rho, v1, T)` and their derivatives.
+Only the velocity and the temperature need face derivatives
+([`GradientCentral`](@ref) in their schemes).
+
+!!! warning "Experimental code"
+    This code is experimental and may change in any future release.
+"""
+@inline function face2flux_navier_stokes_primitive(w, equations)
+    return SVector(w[1], w[2], w[3])
 end
 end # @muladd

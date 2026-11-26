@@ -187,6 +187,7 @@ include("semidiscretization/semidiscretization.jl")
 include("semidiscretization/semidiscretization_hyperbolic.jl")
 include("semidiscretization/semidiscretization_parabolic.jl")
 include("semidiscretization/semidiscretization_hyperbolic_parabolic.jl")
+include("solvers/macrocellfv/macrocellfv_parabolic.jl")
 include("semidiscretization/semidiscretization_euler_acoustics.jl")
 include("semidiscretization/semidiscretization_coupled.jl")
 include("semidiscretization/semidiscretization_split.jl")
@@ -326,7 +327,9 @@ export DG,
        MacroCellFV, VolumeIntegralMacroCellFV,
        MomentInversionIdentity, MomentInversionCentral, MomentInversionWENO,
        ReconstructionConstant, ReconstructionMUSCL,
-       ReconstructionWENO5JS, ReconstructionWENO5Z,
+       ReconstructionWENO5JS, ReconstructionWENO5Z, ReconstructionCentral,
+       CombinedScheme, GradientCentral, GradientNone, gradient_sum,
+       cons2prim_temperature_pressure, face2flux_navier_stokes_primitive,
        VolumeIntegralWeakForm, VolumeIntegralStrongForm,
        VolumeIntegralFluxDifferencing,
        HalfSweep, FullSweep, FullSweepGlobal, Tuning,

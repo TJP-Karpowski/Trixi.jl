@@ -19,9 +19,13 @@
 # computed only in the pad cells read by the reconstruction, so that the stencils of
 # the moment inversion lie inside the filled cells.
 # Thread-local line buffers hold the reconstructed states `w_minus[c + 1, v]` and
-# `w_plus[c + 1, v]` of the subcells `c = 0, ..., n + 1` at their faces in negative and
-# positive x direction and the numerical fluxes `flux[f, v]` at the faces
-# `f = 1, ..., n + 1` (face `f` between the subcells `f - 1` and `f`).
+# `w_plus[c + 1, v]` of the reconstruction variables `v` of the subcells
+# `c = 0, ..., n + 1` at their faces in negative and positive x direction (for the
+# central stencils: the halves of the face values, see `ReconstructionCentral`), with
+# diffusion the halves of the face derivatives `dw_minus[c + 1, v]` and
+# `dw_plus[c + 1, v]` (empty without face derivatives), and the numerical fluxes
+# `flux[f, v]` at the faces `f = 1, ..., n + 1` (face `f` between the subcells `f - 1`
+# and `f`).
 # The neighbors of each element are looked up in `neighbor_elements[side, element]`
 # (`side = 1` at -x, `2` at +x; `0` at a physical boundary) and the boundaries in
 # `boundary_ids[side, element]`.
@@ -42,11 +46,13 @@ function create_cache_volume_integral(mesh::TreeMesh{1}, equations,
     pad_points_threaded = [Matrix{uEltype}(undef, n_pad_points,
                                            npadvariables(volume_integral, equations))
                            for _ in 1:Threads.maxthreadid()]
+    n_recon = nreconvariables(volume_integral, equations)
+    n_derivative = has_gradients(volume_integral) isa True ? n + 2 : 0
     line_buffers_threaded = [(;
-                              w_minus = Matrix{uEltype}(undef, n + 2,
-                                                        nvariables(equations)),
-                              w_plus = Matrix{uEltype}(undef, n + 2,
-                                                       nvariables(equations)),
+                              w_minus = Matrix{uEltype}(undef, n + 2, n_recon),
+                              w_plus = Matrix{uEltype}(undef, n + 2, n_recon),
+                              dw_minus = Matrix{uEltype}(undef, n_derivative, n_recon),
+                              dw_plus = Matrix{uEltype}(undef, n_derivative, n_recon),
                               flux = Matrix{uEltype}(undef, n + 1,
                                                      nvariables(equations)))
                              for _ in 1:Threads.maxthreadid()]
@@ -74,6 +80,7 @@ function create_cache_volume_integral(mesh::TreeMesh{1}, equations,
                                          real(dg))
     subcell_quadrature = (; nodes, weights)
 
+    # (only arrays: a scalar field in the cache made the element kernel slower)
     return (; pad_threaded, pad_points_threaded, line_buffers_threaded,
             neighbor_elements, boundary_ids, subcell_quadrature)
 end
@@ -89,6 +96,17 @@ end
 function rhs_hyperbolic!(backend::Nothing, du, u, t, mesh::TreeMesh{1}, equations,
                          boundary_conditions, source_terms::Source,
                          dg::MacroCellFV, cache) where {Source}
+    rhs_macrocellfv!(du, u, t, mesh, equations, nothing, boundary_conditions,
+                     source_terms, dg, cache)
+    return nothing
+end
+
+# Right-hand side of the advective (`equations_parabolic === nothing`) or the advective
+# and diffusive terms (`SemidiscretizationHyperbolicParabolic`, see
+# `macrocellfv_parabolic.jl`), plus the source terms
+function rhs_macrocellfv!(du, u, t, mesh::TreeMesh{1}, equations, equations_parabolic,
+                          boundary_conditions, source_terms::Source,
+                          dg::MacroCellFV, cache) where {Source}
     # The boundary conditions at -x and +x (type-stable access in the element loop)
     boundary_conditions_sides = (boundary_condition_side(boundary_conditions, 1),
                                  boundary_condition_side(boundary_conditions, 2))
@@ -99,8 +117,9 @@ function rhs_hyperbolic!(backend::Nothing, du, u, t, mesh::TreeMesh{1}, equation
             pad_points = cache.pad_points_threaded[Threads.threadid()]
             line_buffers = cache.line_buffers_threaded[Threads.threadid()]
             calc_macrocell_element!(du, pad, pad_points, line_buffers, u, t, element,
-                                    boundary_conditions_sides, mesh, equations,
-                                    dg.volume_integral, dg, cache)
+                                    boundary_conditions_sides, source_terms, mesh,
+                                    equations, equations_parabolic, dg.volume_integral,
+                                    dg, cache)
         end
     end
 
@@ -124,11 +143,12 @@ end
 # The line is processed in two passes, each a loop that vectorizes: all subcells are
 # reconstructed (one variable at a time), then the fluxes at all faces are computed.
 function calc_macrocell_element!(du, pad, pad_points, line_buffers, u, t, element,
-                                 boundary_conditions_sides, mesh::TreeMesh{1},
-                                 equations, volume_integral, dg::MacroCellFV, cache)
+                                 boundary_conditions_sides, source_terms,
+                                 mesh::TreeMesh{1}, equations, equations_parabolic,
+                                 volume_integral, dg::MacroCellFV, cache)
     @unpack surface_flux_values = cache.elements
     @unpack neighbor_elements, boundary_ids = cache
-    @unpack w_minus, w_plus, flux = line_buffers
+    @unpack flux = line_buffers
     g = nhalo(dg)
     n = nnodes(dg)
 
@@ -147,11 +167,13 @@ function calc_macrocell_element!(du, pad, pad_points, line_buffers, u, t, elemen
     # The first face: the boundary face at -x (between the ghost subcell 0 and the
     # subcell 1) at a physical boundary, otherwise the +x face of the subcell 1
     f_first = boundary_ids[1, element] != 0 ? 1 : 2
-    reconstruct_line!(w_minus, w_plus, line_pad, volume_integral.reconstruction,
-                      f_first - 1, n + 1, g, equations)
-    calc_line_fluxes!(flux, w_minus, w_plus, f_first, n + 1, equations, volume_integral)
-
+    reconstruct_pad_variables!(line_buffers, line_pad, volume_integral.reconstruction,
+                               volume_integral.schemes, f_first - 1, n + 1, g,
+                               Val(nreconvariables(volume_integral, equations)))
     inv_h = inv_subcell_width(mesh, dg, cache, element)
+    calc_line_fluxes!(flux, line_buffers, f_first, n + 1, inv_h, equations,
+                      equations_parabolic, volume_integral)
+
     right_element = neighbor_elements[2, element]
     @inbounds for v in eachvariable(equations)
         if f_first == 1
@@ -169,6 +191,9 @@ function calc_macrocell_element!(du, pad, pad_points, line_buffers, u, t, elemen
         end
     end
 
+    add_macrocell_source_terms!(du, u, t, source_terms, element, inv_h, mesh, equations,
+                                dg, cache)
+
     return nothing
 end
 
@@ -179,8 +204,9 @@ end
 # stencils of the subcells `0:(n + 1)` lie inside the pad (checked by the test suite
 # with `--check-bounds=yes`).
 @noinline function reconstruct_line!(w_minus, w_plus, pad, reconstruction, c_first,
-                                     c_last, g, equations)
-    for v in eachvariable(equations)
+                                     c_last, g, ::Val{NRecon}) where {NRecon}
+    # (a loop of known length, as `eachvariable(equations)`)
+    for v in Base.OneTo(NRecon)
         @inbounds @simd ivdep for c in c_first:c_last
             a = c + g
             wm, wp = reconstruct_cell(reconstruction,
@@ -192,15 +218,207 @@ end
     return nothing
 end
 
+# The schemes of the reconstruction variables: the same value-only reconstruction for
+# all variables (as one loop over the variables), the same combined scheme for all
+# variables, or one scheme per variable (unrolled over the tuple of schemes)
+@inline function reconstruct_pad_variables!(line_buffers, pad, reconstruction,
+                                            ::Nothing, c_first, c_last, g, n_recon)
+    @unpack w_minus, w_plus = line_buffers
+    reconstruct_line!(w_minus, w_plus, pad, reconstruction, c_first, c_last, g, n_recon)
+    return nothing
+end
+
+@inline function reconstruct_pad_variables!(line_buffers, pad,
+                                            reconstruction::CombinedScheme, ::Nothing,
+                                            c_first, c_last, g,
+                                            ::Val{NRecon}) where {NRecon}
+    for v in Base.OneTo(NRecon)
+        reconstruct_variable!(line_buffers, pad, reconstruction, v, c_first, c_last, g)
+    end
+    return nothing
+end
+
+@inline function reconstruct_pad_variables!(line_buffers, pad, reconstruction,
+                                            schemes::Tuple, c_first, c_last, g, n_recon)
+    reconstruct_scheme_tuple!(line_buffers, pad, schemes, 1, c_first, c_last, g)
+    return nothing
+end
+
+@inline function reconstruct_scheme_tuple!(line_buffers, pad, schemes::Tuple, v,
+                                           c_first, c_last, g)
+    reconstruct_variable!(line_buffers, pad, first(schemes), v, c_first, c_last, g)
+    reconstruct_scheme_tuple!(line_buffers, pad, Base.tail(schemes), v + 1, c_first,
+                              c_last, g)
+    return nothing
+end
+@inline reconstruct_scheme_tuple!(line_buffers, pad, ::Tuple{}, v, c_first, c_last, g) = nothing
+
+# One reconstruction variable `v` with its scheme
+@inline function reconstruct_variable!(line_buffers, pad, reconstruction, v, c_first,
+                                       c_last, g)
+    @unpack w_minus, w_plus = line_buffers
+    reconstruct_variable_values!(w_minus, w_plus, pad, reconstruction, v, c_first,
+                                 c_last, g)
+    return nothing
+end
+
+@inline function reconstruct_variable!(line_buffers, pad, scheme::CombinedScheme, v,
+                                       c_first, c_last, g)
+    reconstruct_variable!(has_gradient(scheme), line_buffers, pad, scheme, v, c_first,
+                          c_last, g)
+    return nothing
+end
+
+# Without derivatives: the values only
+@inline function reconstruct_variable!(::False, line_buffers, pad, scheme, v, c_first,
+                                       c_last, g)
+    @unpack w_minus, w_plus = line_buffers
+    reconstruct_variable_values!(w_minus, w_plus, pad, scheme.reconstruction, v,
+                                 c_first, c_last, g)
+    return nothing
+end
+
+# Values and derivatives in one loop over the subcells (as fast as hand-fused
+# combinations that load the stencil once, and faster than separate loops for the
+# values and the derivatives; see the studies of the solver)
+@inline function reconstruct_variable!(::True, line_buffers, pad, scheme, v, c_first,
+                                       c_last, g)
+    @unpack w_minus, w_plus, dw_minus, dw_plus = line_buffers
+    evaluate_variable!(w_minus, w_plus, dw_minus, dw_plus, pad, scheme, v, c_first,
+                       c_last, g)
+    return nothing
+end
+
+@noinline function evaluate_variable!(w_minus, w_plus, dw_minus, dw_plus, pad, scheme,
+                                      v, c_first, c_last, g)
+    @inbounds @simd ivdep for c in c_first:c_last
+        a = c + g
+        wm, wp, dm, dp = evaluate_cell(scheme,
+                                       @inline(offset->@inbounds(pad[a + offset, v])))
+        w_minus[c + 1, v] = wm
+        w_plus[c + 1, v] = wp
+        dw_minus[c + 1, v] = dm
+        dw_plus[c + 1, v] = dp
+    end
+    return nothing
+end
+
+@noinline function reconstruct_variable_values!(w_minus, w_plus, pad, reconstruction, v,
+                                                c_first, c_last, g)
+    @inbounds @simd ivdep for c in c_first:c_last
+        a = c + g
+        wm, wp = reconstruct_cell(reconstruction,
+                                  @inline(offset->@inbounds(pad[a + offset, v])))
+        w_minus[c + 1, v] = wm
+        w_plus[c + 1, v] = wp
+    end
+    return nothing
+end
+
+# The states of the reconstruction variables at the face `f` on its left and right
+# sides (both the assembled central value for `ReconstructionCentral`)
+@inline function face_states(w_minus, w_plus, f, volume_integral, equations)
+    states = ntuple(@inline(v->macrocell_face_values(pad_scheme(volume_integral, v),
+                                                     w_plus[f, v], w_minus[f + 1, v])),
+                    Val(nreconvariables(volume_integral, equations)))
+    return SVector(map(first, states)), SVector(map(last, states))
+end
+
+# The same scheme for all reconstruction variables: the states as stored, or the
+# assembled central values
+@inline function face_states(w_minus, w_plus, f,
+                             volume_integral::VolumeIntegralMacroCellFV{<:Any, <:Any,
+                                                                        Nothing},
+                             equations)
+    face_states_reconstructed(volume_integral.reconstruction, w_minus, w_plus, f,
+                              volume_integral, equations)
+end
+@inline function face_states_reconstructed(reconstruction, w_minus, w_plus, f,
+                                           volume_integral, equations)
+    return face_states_reconstructed(has_central_values(reconstruction), reconstruction,
+                                     w_minus, w_plus, f, volume_integral, equations)
+end
+@inline function face_states_reconstructed(::False, reconstruction, w_minus, w_plus, f,
+                                           volume_integral, equations)
+    n_recon = Val(nreconvariables(volume_integral, equations))
+    w_ll = SVector(ntuple(@inline(v->w_plus[f, v]), n_recon))
+    w_rr = SVector(ntuple(@inline(v->w_minus[f + 1, v]), n_recon))
+    return w_ll, w_rr
+end
+@inline function face_states_reconstructed(::True, reconstruction, w_minus, w_plus, f,
+                                           volume_integral, equations)
+    states = ntuple(@inline(v->macrocell_face_values(reconstruction, w_plus[f, v],
+                                                     w_minus[f + 1, v])),
+                    Val(nreconvariables(volume_integral, equations)))
+    return SVector(map(first, states)), SVector(map(last, states))
+end
+
+# The derivatives of the reconstruction variables at the face `f` (zero for the
+# variables without face derivatives)
+@inline function face_derivatives(dw_minus, dw_plus, f, inv_h, volume_integral,
+                                  equations)
+    @unpack surface_gradient = volume_integral
+    derivatives = ntuple(@inline(v->face_derivative(has_gradient(pad_scheme(volume_integral,
+                                                                            v)),
+                                                    surface_gradient, dw_minus,
+                                                    dw_plus, f, v, inv_h)),
+                         Val(nreconvariables(volume_integral, equations)))
+    return SVector(derivatives)
+end
+
+@inline function face_derivative(::True, surface_gradient, dw_minus, dw_plus, f, v,
+                                 inv_h)
+    return surface_gradient(dw_plus[f, v], dw_minus[f + 1, v]) * inv_h
+end
+@inline function face_derivative(::False, surface_gradient, dw_minus, dw_plus, f, v,
+                                 inv_h)
+    return zero(eltype(dw_plus))
+end
+
 # Numerical fluxes at the faces `f_first:f_last` (vectorized over the faces)
+@inline function calc_line_fluxes!(flux, line_buffers, f_first, f_last, inv_h,
+                                   equations, equations_parabolic::Nothing,
+                                   volume_integral)
+    @unpack w_minus, w_plus = line_buffers
+    calc_line_fluxes!(flux, w_minus, w_plus, f_first, f_last, equations,
+                      volume_integral)
+    return nothing
+end
+
+# (a separate function with the line buffers as arguments: passing the named tuple of
+# all line buffers to a non-inlined function made the advective kernel slower)
 @noinline function calc_line_fluxes!(flux, w_minus, w_plus, f_first, f_last, equations,
                                      volume_integral)
     @inbounds @simd ivdep for f in f_first:f_last
         # The subcell `f - 1` on the left, the subcell `f` on the right of the face
-        w_ll = SVector(ntuple(@inline(v->w_plus[f, v]), Val(nvariables(equations))))
-        w_rr = SVector(ntuple(@inline(v->w_minus[f + 1, v]),
-                              Val(nvariables(equations))))
+        w_ll, w_rr = face_states(w_minus, w_plus, f, volume_integral, equations)
         flux_face = macrocell_face_flux(w_ll, w_rr, 1, equations, volume_integral)
+        for v in eachvariable(equations)
+            flux[f, v] = flux_face[v]
+        end
+    end
+    return nothing
+end
+
+# Advective and diffusive fluxes at the faces `f_first:f_last`
+@inline function calc_line_fluxes!(flux, line_buffers, f_first, f_last, inv_h,
+                                   equations, equations_parabolic, volume_integral)
+    @unpack w_minus, w_plus, dw_minus, dw_plus = line_buffers
+    calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus, f_first, f_last, inv_h,
+                      equations, equations_parabolic, volume_integral)
+    return nothing
+end
+
+@noinline function calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus, f_first,
+                                     f_last, inv_h, equations, equations_parabolic,
+                                     volume_integral)
+    @inbounds @simd ivdep for f in f_first:f_last
+        w_ll, w_rr = face_states(w_minus, w_plus, f, volume_integral, equations)
+        w_face = 0.5f0 * (w_ll + w_rr)
+        dw_face = face_derivatives(dw_minus, dw_plus, f, inv_h, volume_integral,
+                                   equations)
+        flux_face = macrocell_face_flux(w_ll, w_rr, w_face, dw_face, 1, equations,
+                                        equations_parabolic, volume_integral)
         for v in eachvariable(equations)
             flux[f, v] = flux_face[v]
         end
@@ -217,6 +435,50 @@ end
                               element)
     inv_h = inv_subcell_width(mesh, dg, cache, element)
     set_node_vars!(du, -inv_h * (flux_right - flux_left), equations, dg, 1, element)
+    return nothing
+end
+
+# Source terms: the averages of the source terms over the subcells (Gauss-Legendre
+# quadrature of `initial_condition_nodes`, with the subcell average as state). The
+# first subcell holds the flux at its +x face until `finish_macrocell_first_subcell!`
+# computes `-(flux_right - flux_left) / h`, so `h` times its source term is subtracted
+# from that flux.
+@inline function add_macrocell_source_terms!(du, u, t, source_terms::Nothing, element,
+                                             inv_h, mesh::TreeMesh{1}, equations,
+                                             dg::MacroCellFV, cache)
+    return nothing
+end
+
+@inline function add_macrocell_source_terms!(du, u, t, source_terms, element, inv_h,
+                                             mesh::TreeMesh{1}, equations,
+                                             dg::MacroCellFV, cache)
+    add_macrocell_source_terms_1d!(du, u, t, source_terms, element, inv_h, equations,
+                                   dg, cache)
+    return nothing
+end
+
+@noinline function add_macrocell_source_terms_1d!(du, u, t, source_terms, element,
+                                                  inv_h, equations, dg, cache)
+    @unpack nodes, weights = cache.subcell_quadrature
+    h = inv(inv_h)
+    for i in eachnode(dg)
+        u_local = get_node_vars(u, equations, dg, i, element)
+        x_c = get_node_coords(cache.elements.node_coordinates, equations, dg, i,
+                              element)
+        source = 0.5f0 * weights[1] *
+                 source_terms(u_local, SVector(x_c[1] + 0.5f0 * h * nodes[1]), t,
+                              equations)
+        for q in 2:length(nodes)
+            x_q = SVector(x_c[1] + 0.5f0 * h * nodes[q])
+            source = source +
+                     0.5f0 * weights[q] * source_terms(u_local, x_q, t, equations)
+        end
+        if i == 1
+            add_to_node_vars!(du, -h * source, equations, dg, i, element)
+        else
+            add_to_node_vars!(du, source, equations, dg, i, element)
+        end
+    end
     return nothing
 end
 
@@ -398,7 +660,7 @@ end
 @inline function pad_center2recon!(pad, a_first, a_last, center2recon, equations)
     @inbounds for a in a_first:a_last
         w = center2recon(get_pad_vars(pad, equations, a), equations)
-        for v in eachvariable(equations)
+        for v in eachindex(w)
             pad[a, v] = w[v]
         end
     end
