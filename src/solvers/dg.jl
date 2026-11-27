@@ -1607,6 +1607,7 @@ include("macrocellfv/schemes/moment_inversion.jl")
 include("macrocellfv/schemes/weno/moment_inversion_weno.jl")
 include("macrocellfv/schemes/central.jl")
 include("macrocellfv/macrocellfv.jl")
+include("macrocellfv/line_kernels.jl")
 include("macrocellfv/macrocellfv_1d.jl")
 
 function allocate_coefficients(mesh::AbstractMesh, equations, dg::DG, cache)

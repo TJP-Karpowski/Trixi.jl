@@ -86,18 +86,25 @@ end
 # The two halves of the value at the faces of the subcell: `(w_minus, w_plus)` are the
 # right half of its face in negative direction and the left half of its face in
 # positive direction
-@inline function reconstruct_cell(reconstruction::ReconstructionCentral{M},
-                                  stencil) where {M}
-    @unpack weights = reconstruction
+@inline function reconstruct_cell(reconstruction::ReconstructionCentral, stencil)
+    return central_halves(reconstruction.weights, stencil)
+end
+
+# The two halves `(Σ_k h_k a(k - 1), Σ_k h_k a(1 - k))` of a central stencil with the
+# half weights `h_1, ..., h_M` (`k = 1` is the subcell itself), written as a fold over a
+# tuple, which is unrolled: a `for` loop over `k` prevented the vectorization of the loop
+# over the subcells for `M = 3` (sixth order)
+@inline function central_halves(weights::NTuple{M}, stencil) where {M}
     u_0 = stencil(0)
     RealT = typeof(u_0)
-    w_minus = convert(RealT, weights[1]) * u_0
-    w_plus = w_minus
-    for k in 2:M
-        w_minus = w_minus + convert(RealT, weights[k]) * stencil(k - 1)
-        w_plus = w_plus + convert(RealT, weights[k]) * stencil(1 - k)
-    end
-    return w_minus, w_plus
+    w_0 = convert(RealT, weights[1]) * u_0
+    ks = ntuple(k -> k + 1, Val(M - 1))
+    w_right = foldl(@inline((w, k)->w + convert(RealT, weights[k]) * stencil(k - 1)),
+                    ks;
+                    init = w_0)
+    w_left = foldl(@inline((w, k)->w + convert(RealT, weights[k]) * stencil(1 - k)), ks;
+                   init = w_0)
+    return w_right, w_left
 end
 
 # Face states from the values `w_left` (from the subcell on the left side of the face,
@@ -109,11 +116,6 @@ end
     w = w_left + w_right
     return w, w
 end
-
-# `True()` if the face values are the halves of a central stencil (see
-# `macrocell_face_values`)
-@inline has_central_values(reconstruction) = False()
-@inline has_central_values(::ReconstructionCentral) = True()
 
 """
     GradientCentral(order = 2)
@@ -157,17 +159,10 @@ end
 # `reconstruct_cell` of `ReconstructionCentral`); the derivative at a face is the sum of
 # the left half of the subcell on its left and the right half of the subcell on its
 # right
-@inline function differentiate_cell(gradient::GradientCentral{M}, stencil) where {M}
-    @unpack weights = gradient
-    u_0 = stencil(0)
-    RealT = typeof(u_0)
-    d_minus = -convert(RealT, weights[1]) * u_0
-    d_plus = convert(RealT, weights[1]) * u_0
-    for k in 2:M
-        d_minus = d_minus - convert(RealT, weights[k]) * stencil(k - 1)
-        d_plus = d_plus + convert(RealT, weights[k]) * stencil(1 - k)
-    end
-    return d_minus, d_plus
+@inline function differentiate_cell(gradient::GradientCentral, stencil)
+    # (antisymmetric weights: the right half has the opposite sign)
+    d_right, d_left = central_halves(gradient.weights, stencil)
+    return -d_right, d_left
 end
 
 """
@@ -220,8 +215,6 @@ end
 @inline function macrocell_face_values(scheme::CombinedScheme, w_left, w_right)
     return macrocell_face_values(scheme.reconstruction, w_left, w_right)
 end
-
-@inline has_central_values(scheme::CombinedScheme) = has_central_values(scheme.reconstruction)
 
 # `True()` if the scheme computes face derivatives
 @inline has_gradient(scheme) = False()
