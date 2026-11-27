@@ -180,7 +180,13 @@ subcells per coordinate direction in each element (macro-cell) of the mesh, with
 reconstruction of the face states. As for [`BlockFV`](@ref), the subcells
 are stored with a [`UniformFiniteVolumeBasis`](@ref); for consistency with `BlockFV`,
 the number of subcells can also be given as `n_nodes`. Currently supported on the 1D
-[`TreeMesh`](@ref).
+and 2D [`TreeMesh`](@ref); in 2D only on periodic meshes without mortars and with
+`MomentInversionIdentity` so far. In 2D, the faces normal to x and to y are computed
+along the x- and y-lines of subcells with the same (one-dimensional) reconstruction and
+face derivatives. Of the subcell averages, they give the face averages of the states and
+of the normal derivatives, so the scheme keeps the order of the stencils for linear
+fluxes (e.g., linear advection with [`LaplaceDiffusion2D`](@ref)) and is second-order
+accurate for nonlinear fluxes.
 
 - `surface_flux`: numerical flux at the subcell faces, e.g.,
   [`flux_lax_friedrichs`](@ref) or [`flux_hllc`](@ref).
@@ -401,10 +407,16 @@ end
                                                             equations,
                                                             equations_parabolic)
     flux_advective = surface_flux(u_ll, u_rr, orientation, equations)
-    flux_diffusive = flux(u_diffusive, (gradient,), orientation, equations_parabolic)
+    gradients = macrocell_gradients(gradient, orientation, equations_parabolic)
+    flux_diffusive = flux(u_diffusive, gradients, orientation, equations_parabolic)
 
     return flux_advective - flux_diffusive
 end
+
+# The gradients of the diffusive flux (one entry per coordinate direction) from the
+# derivatives along the face normal `orientation`. In 1D, only the normal derivative
+# exists; for 2D, see `macrocellfv_parabolic.jl`.
+@inline macrocell_gradients(gradient, orientation, ::AbstractEquationsParabolic{1}) = (gradient,)
 
 """
     macrocell_face2flux(face2flux, w_ll, w_rr, w_face, dw_face,

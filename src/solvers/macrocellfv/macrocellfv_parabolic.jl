@@ -21,7 +21,15 @@ const SemidiscretizationHyperbolicParabolicMacroCellFV = SemidiscretizationHyper
                                                                                                <:Any,
                                                                                                <:MacroCellFV}
 
+# (one method per mesh type, since a `Union` of the mesh types would be ambiguous with
+# the methods for `DG`)
 function create_cache_parabolic(mesh::TreeMesh{1},
+                                equations_hyperbolic::AbstractEquations,
+                                dg::MacroCellFV, n_elements, uEltype)
+    return NamedTuple()
+end
+
+function create_cache_parabolic(mesh::TreeMesh{2},
                                 equations_hyperbolic::AbstractEquations,
                                 dg::MacroCellFV, n_elements, uEltype)
     return NamedTuple()
@@ -52,6 +60,7 @@ function check_macrocellfv_parabolic(semi)
         throw(ArgumentError("diffusion with `MacroCellFV` needs face derivatives: use a " *
                             "`CombinedScheme` with `GradientCentral` as `reconstruction` " *
                             "or in `schemes`"))
+    check_macrocellfv_parabolic(semi.mesh, semi.equations_parabolic)
     source_terms_parabolic === nothing ||
         throw(ArgumentError("`MacroCellFV` does not support `source_terms_parabolic`; " *
                             "use `source_terms`"))
@@ -62,6 +71,15 @@ function check_macrocellfv_parabolic(semi)
                             "subcells of the hyperbolic boundary conditions; the " *
                             "parabolic boundary conditions must be the same"))
     return nothing
+end
+
+check_macrocellfv_parabolic(mesh::TreeMesh{1}, equations_parabolic) = nothing
+
+# In 2D, only isotropic diffusion is supported so far: its flux needs no derivatives
+# tangential to the faces
+check_macrocellfv_parabolic(mesh::TreeMesh{2}, ::LaplaceDiffusion2D) = nothing
+function check_macrocellfv_parabolic(mesh::TreeMesh{2}, equations_parabolic)
+    throw(ArgumentError("`MacroCellFV` in 2D supports only `LaplaceDiffusion2D` so far"))
 end
 
 # The fused right-hand side of the advective and diffusive terms
@@ -86,20 +104,25 @@ function rhs_macrocellfv!(du_ode, u_ode,
     return nothing
 end
 
-function rhs_parabolic!(backend::Nothing, du, u, t, mesh::TreeMesh{1},
-                        equations_parabolic::AbstractEquationsParabolic,
-                        boundary_conditions_parabolic, source_terms_parabolic,
-                        dg::MacroCellFV, parabolic_scheme, cache, cache_parabolic)
-    throw(ArgumentError("`MacroCellFV` has no separate parabolic right-hand side; use " *
-                        "the `ODEProblem` of `semidiscretize`"))
+for Mesh in (TreeMesh{1}, TreeMesh{2})
+    @eval function rhs_parabolic!(backend::Nothing, du, u, t, mesh::$Mesh,
+                                  equations_parabolic::AbstractEquationsParabolic,
+                                  boundary_conditions_parabolic, source_terms_parabolic,
+                                  dg::MacroCellFV, parabolic_scheme, cache,
+                                  cache_parabolic)
+        throw(ArgumentError("`MacroCellFV` has no separate parabolic right-hand side; " *
+                            "use the `ODEProblem` of `semidiscretize`"))
+    end
 end
 
-# Diffusive time step: `h^2 / (2 ν factor)` with the subcell width `h`, the largest
-# diffusivity `ν`, and the stencil factor of the face derivatives and the moment
-# inversion (see `diffusion_dt_factor`); with `cfl_parabolic = 1`, the explicit Euler
-# method is stable for `u_t = ν u_xx` with periodic boundaries.
-function max_dt(u, t, mesh::TreeMesh{1}, constant_diffusivity::True, equations,
-                equations_parabolic::AbstractEquationsParabolic, dg::MacroCellFV, cache)
+# Diffusive time step: `h^2 / (2 d ν factor)` with the subcell width `h`, the number of
+# space dimensions `d`, the largest diffusivity `ν`, and the stencil factor of the face
+# derivatives and the moment inversion (see `diffusion_dt_factor`); with
+# `cfl_parabolic = 1`, the explicit Euler method is stable for `u_t = ν Δu` with periodic
+# boundaries (the eigenvalues of the directions add up).
+function max_dt_macrocellfv(u, t, mesh, constant_diffusivity::True, equations,
+                            equations_parabolic::AbstractEquationsParabolic,
+                            dg::MacroCellFV, cache)
     max_scaled_diffusivity = nextfloat(zero(t))
     diffusivity = max_diffusivity(equations_parabolic)
     for element in eachelement(dg, cache)
@@ -107,16 +130,20 @@ function max_dt(u, t, mesh::TreeMesh{1}, constant_diffusivity::True, equations,
         max_scaled_diffusivity = Base.max(max_scaled_diffusivity,
                                           inv_h^2 * diffusivity)
     end
-    return 1 / (2 * dg.volume_integral.diffusion_dt_factor * max_scaled_diffusivity)
+    return 1 / (2 * ndims(mesh) * dg.volume_integral.diffusion_dt_factor *
+            max_scaled_diffusivity)
 end
 
-function max_dt(u, t, mesh::TreeMesh{1}, constant_diffusivity::False, equations,
-                equations_parabolic::AbstractEquationsParabolic, dg::MacroCellFV, cache)
+function max_dt_macrocellfv(u, t, mesh, constant_diffusivity::False, equations,
+                            equations_parabolic::AbstractEquationsParabolic,
+                            dg::MacroCellFV, cache)
     max_scaled_diffusivity = nextfloat(zero(t))
+    # (outside of the `@batch` loop, which does not support closures)
+    nodes = CartesianIndices(ntuple(_ -> nnodes(dg), Val(ndims(mesh))))
     @batch reduction=(max, max_scaled_diffusivity) for element in eachelement(dg, cache)
         max_diffusivity_ = zero(max_scaled_diffusivity)
-        for i in eachnode(dg)
-            u_node = get_node_vars(u, equations, dg, i, element)
+        for node in nodes
+            u_node = get_node_vars(u, equations, dg, Tuple(node)..., element)
             max_diffusivity_ = Base.max(max_diffusivity_,
                                         max_diffusivity(u_node, equations_parabolic))
         end
@@ -124,7 +151,32 @@ function max_dt(u, t, mesh::TreeMesh{1}, constant_diffusivity::False, equations,
         max_scaled_diffusivity = Base.max(max_scaled_diffusivity,
                                           inv_h^2 * max_diffusivity_)
     end
-    return 1 / (2 * dg.volume_integral.diffusion_dt_factor * max_scaled_diffusivity)
+    return 1 / (2 * ndims(mesh) * dg.volume_integral.diffusion_dt_factor *
+            max_scaled_diffusivity)
+end
+
+# (one method per mesh type, since a `Union` of the mesh types would be ambiguous with
+# the methods for `DG`)
+for Mesh in (TreeMesh{1}, TreeMesh{2}), ConstantDiffusivity in (True, False)
+    @eval function max_dt(u, t, mesh::$Mesh, constant_diffusivity::$ConstantDiffusivity,
+                          equations,
+                          equations_parabolic::AbstractEquationsParabolic,
+                          dg::MacroCellFV, cache)
+        return max_dt_macrocellfv(u, t, mesh, constant_diffusivity, equations,
+                                  equations_parabolic, dg, cache)
+    end
+end
+
+# For the isotropic `LaplaceDiffusion2D`, the flux in the direction `orientation`
+# depends only on the derivative along this direction, so the tangential entry of the
+# gradients is zero.
+@inline function macrocell_gradients(gradient, orientation, ::LaplaceDiffusion2D)
+    zero_gradient = zero(gradient)
+    if orientation == 1
+        return (gradient, zero_gradient)
+    else
+        return (zero_gradient, gradient)
+    end
 end
 
 # Face transformation for the compressible Navier-Stokes equations (see

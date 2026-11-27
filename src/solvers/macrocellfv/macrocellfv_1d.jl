@@ -170,7 +170,7 @@ function calc_macrocell_element!(du, pad, pad_points, line_buffers, u, t, elemen
     reconstruct_line!(line_buffers, line_pad, volume_integral, f_first - 1, n + 1, g,
                       Val(nreconvariables(volume_integral, equations)))
     inv_h = inv_subcell_width(mesh, dg, cache, element)
-    calc_line_fluxes!(flux, line_buffers, f_first, n + 1, inv_h, equations,
+    calc_line_fluxes!(flux, line_buffers, f_first, n + 1, inv_h, 1, equations,
                       equations_parabolic, volume_integral)
 
     right_element = neighbor_elements[2, element]
@@ -438,7 +438,8 @@ end
 end
 
 # Inverse subcell width of `element` (`inverse_jacobian = 2 / dx` of the element)
-@inline function inv_subcell_width(mesh::TreeMesh{1}, dg::MacroCellFV, cache,
+@inline function inv_subcell_width(mesh::Union{TreeMesh{1}, TreeMesh{2}},
+                                   dg::MacroCellFV, cache,
                                    element)
     return cache.elements.inverse_jacobian[element] * nnodes(dg) / 2
 end

@@ -182,42 +182,46 @@ end
 # Pass 2: fluxes at the faces of the line
 
 """
-    calc_line_fluxes!(flux, line_buffers, f_first, f_last, inv_h,
+    calc_line_fluxes!(flux, line_buffers, f_first, f_last, inv_h, orientation,
                       equations, equations_parabolic, volume_integral)
 
 Fluxes `flux[f, :]` at the faces `f = f_first:f_last` of the line from the face values
 (and derivatives) of pass 1. Without diffusion (`equations_parabolic === nothing`),
 the numerical flux of the two face states; with diffusion, the numerical flux minus the
 diffusive flux of the face state and the face derivatives (`macrocell_face_flux`).
-`inv_h` is the inverse subcell width (for the face derivatives).
+`inv_h` is the inverse subcell width (for the face derivatives) and `orientation` the
+coordinate direction of the line (`1` for x, `2` for y), i.e., the normal direction of
+its faces.
 """
 @inline function calc_line_fluxes!(flux, line_buffers, f_first, f_last, inv_h,
-                                   equations, equations_parabolic, volume_integral)
+                                   orientation, equations, equations_parabolic,
+                                   volume_integral)
     @unpack w_minus, w_plus, dw_minus, dw_plus = line_buffers
     calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus, f_first, f_last, inv_h,
-                      equations, equations_parabolic, volume_integral)
+                      orientation, equations, equations_parabolic, volume_integral)
     return nothing
 end
 
 # Without diffusion, the derivative buffers are not passed to the face loop (passing
 # them made the advective kernel slower)
 @inline function calc_line_fluxes!(flux, line_buffers, f_first, f_last, inv_h,
-                                   equations, equations_parabolic::Nothing,
+                                   orientation, equations, equations_parabolic::Nothing,
                                    volume_integral)
     @unpack w_minus, w_plus = line_buffers
     calc_line_fluxes!(flux, w_minus, w_plus, nothing, nothing, f_first, f_last, inv_h,
-                      equations, equations_parabolic, volume_integral)
+                      orientation, equations, equations_parabolic, volume_integral)
     return nothing
 end
 
 @noinline function calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus, f_first,
-                                     f_last, inv_h, equations, equations_parabolic,
-                                     volume_integral)
+                                     f_last, inv_h, orientation, equations,
+                                     equations_parabolic, volume_integral)
     @inbounds @simd ivdep for f in f_first:f_last
         # The subcell `f - 1` on the left, the subcell `f` on the right of the face
         w_ll, w_rr = face_states(w_minus, w_plus, f, volume_integral, equations)
-        flux_face = line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, equations,
-                                   equations_parabolic, volume_integral)
+        flux_face = line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h,
+                                   orientation, equations, equations_parabolic,
+                                   volume_integral)
         for v in eachvariable(equations)
             flux[f, v] = flux_face[v]
         end
@@ -226,18 +230,19 @@ end
 end
 
 # Advective flux only
-@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, equations,
-                                equations_parabolic::Nothing, volume_integral)
-    return macrocell_face_flux(w_ll, w_rr, 1, equations, volume_integral)
+@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, orientation,
+                                equations, equations_parabolic::Nothing,
+                                volume_integral)
+    return macrocell_face_flux(w_ll, w_rr, orientation, equations, volume_integral)
 end
 
 # Advective minus diffusive flux; the state of the diffusive flux is the mean of the two
 # face states (the central value for central stencils)
-@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, equations,
-                                equations_parabolic, volume_integral)
+@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, orientation,
+                                equations, equations_parabolic, volume_integral)
     w_face = 0.5f0 * (w_ll + w_rr)
     dw_face = face_derivatives(dw_minus, dw_plus, f, inv_h, volume_integral, equations)
-    return macrocell_face_flux(w_ll, w_rr, w_face, dw_face, 1, equations,
+    return macrocell_face_flux(w_ll, w_rr, w_face, dw_face, orientation, equations,
                                equations_parabolic, volume_integral)
 end
 

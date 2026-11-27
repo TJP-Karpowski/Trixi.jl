@@ -1609,6 +1609,7 @@ include("macrocellfv/schemes/central.jl")
 include("macrocellfv/macrocellfv.jl")
 include("macrocellfv/line_kernels.jl")
 include("macrocellfv/macrocellfv_1d.jl")
+include("macrocellfv/macrocellfv_2d.jl")
 
 function allocate_coefficients(mesh::AbstractMesh, equations, dg::DG, cache)
     # We must allocate a `Vector` in order to be able to `resize!` it (AMR).
