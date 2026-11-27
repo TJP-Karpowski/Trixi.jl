@@ -197,7 +197,8 @@ its faces.
                                    orientation, equations, equations_parabolic,
                                    volume_integral)
     @unpack w_minus, w_plus, dw_minus, dw_plus = line_buffers
-    calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus, f_first, f_last, inv_h,
+    calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus,
+                      tangential_buffer(line_buffers), f_first, f_last, inv_h,
                       orientation, equations, equations_parabolic, volume_integral)
     return nothing
 end
@@ -208,18 +209,19 @@ end
                                    orientation, equations, equations_parabolic::Nothing,
                                    volume_integral)
     @unpack w_minus, w_plus = line_buffers
-    calc_line_fluxes!(flux, w_minus, w_plus, nothing, nothing, f_first, f_last, inv_h,
-                      orientation, equations, equations_parabolic, volume_integral)
+    calc_line_fluxes!(flux, w_minus, w_plus, nothing, nothing, nothing, f_first, f_last,
+                      inv_h, orientation, equations, equations_parabolic,
+                      volume_integral)
     return nothing
 end
 
-@noinline function calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus, f_first,
-                                     f_last, inv_h, orientation, equations,
-                                     equations_parabolic, volume_integral)
+@noinline function calc_line_fluxes!(flux, w_minus, w_plus, dw_minus, dw_plus,
+                                     tw_face, f_first, f_last, inv_h, orientation,
+                                     equations, equations_parabolic, volume_integral)
     @inbounds @simd ivdep for f in f_first:f_last
         # The subcell `f - 1` on the left, the subcell `f` on the right of the face
         w_ll, w_rr = face_states(w_minus, w_plus, f, volume_integral, equations)
-        flux_face = line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h,
+        flux_face = line_face_flux(w_ll, w_rr, dw_minus, dw_plus, tw_face, f, inv_h,
                                    orientation, equations, equations_parabolic,
                                    volume_integral)
         for v in eachvariable(equations)
@@ -230,19 +232,21 @@ end
 end
 
 # Advective flux only
-@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, orientation,
-                                equations, equations_parabolic::Nothing,
+@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, tw_face, f, inv_h,
+                                orientation, equations, equations_parabolic::Nothing,
                                 volume_integral)
     return macrocell_face_flux(w_ll, w_rr, orientation, equations, volume_integral)
 end
 
 # Advective minus diffusive flux; the state of the diffusive flux is the mean of the two
 # face states (the central value for central stencils)
-@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, f, inv_h, orientation,
-                                equations, equations_parabolic, volume_integral)
+@inline function line_face_flux(w_ll, w_rr, dw_minus, dw_plus, tw_face, f, inv_h,
+                                orientation, equations, equations_parabolic,
+                                volume_integral)
     w_face = 0.5f0 * (w_ll + w_rr)
     dw_face = face_derivatives(dw_minus, dw_plus, f, inv_h, volume_integral, equations)
-    return macrocell_face_flux(w_ll, w_rr, w_face, dw_face, orientation, equations,
+    tw = face_tangential_derivatives(tw_face, f, inv_h, volume_integral, equations)
+    return macrocell_face_flux(w_ll, w_rr, w_face, dw_face, tw, orientation, equations,
                                equations_parabolic, volume_integral)
 end
 
@@ -277,5 +281,33 @@ end
 @inline function face_derivative(::False, surface_gradient, dw_minus, dw_plus, f, v,
                                  inv_h)
     return zero(eltype(dw_plus))
+end
+
+# The derivatives of the reconstruction variables along the face `f` (in 2D, computed
+# before the line by `calc_tangential_derivatives!` and stored in `tw_face[f, v]`, per
+# subcell width; zero for the variables without gradient scheme). Without them
+# (`tw_face === nothing`, e.g., in 1D or for isotropic diffusion), `nothing`.
+@inline face_tangential_derivatives(tw_face::Nothing, f, inv_h, volume_integral,
+equations) = nothing
+
+@inline function face_tangential_derivatives(tw_face, f, inv_h, volume_integral,
+                                             equations)
+    derivatives = ntuple(@inline(v->face_tangential_derivative(has_gradient(pad_scheme(volume_integral,
+                                                                                       v)),
+                                                               tw_face, f, v, inv_h)),
+                         Val(nreconvariables(volume_integral, equations)))
+    return SVector(derivatives)
+end
+
+@inline face_tangential_derivative(::True, tw_face, f, v, inv_h) = tw_face[f, v] * inv_h
+@inline face_tangential_derivative(::False, tw_face, f, v, inv_h) = zero(eltype(tw_face))
+
+# The buffer of the derivatives along the faces of the line buffers (only in 2D with
+# a diffusive flux that needs them)
+@inline tangential_buffer(line_buffers) = nothing
+@inline function tangential_buffer(line_buffers::NamedTuple{(:w_minus, :w_plus,
+                                                             :dw_minus, :dw_plus,
+                                                             :tw_face)})
+    return line_buffers.tw_face
 end
 end # @muladd

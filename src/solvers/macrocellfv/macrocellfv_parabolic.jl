@@ -60,7 +60,7 @@ function check_macrocellfv_parabolic(semi)
         throw(ArgumentError("diffusion with `MacroCellFV` needs face derivatives: use a " *
                             "`CombinedScheme` with `GradientCentral` as `reconstruction` " *
                             "or in `schemes`"))
-    check_macrocellfv_parabolic(semi.mesh, semi.equations_parabolic)
+    check_macrocellfv_parabolic(semi.mesh, semi.equations_parabolic, solver)
     source_terms_parabolic === nothing ||
         throw(ArgumentError("`MacroCellFV` does not support `source_terms_parabolic`; " *
                             "use `source_terms`"))
@@ -73,13 +73,40 @@ function check_macrocellfv_parabolic(semi)
     return nothing
 end
 
-check_macrocellfv_parabolic(mesh::TreeMesh{1}, equations_parabolic) = nothing
+check_macrocellfv_parabolic(mesh::TreeMesh{1}, equations_parabolic, solver) = nothing
 
-# In 2D, only isotropic diffusion is supported so far: its flux needs no derivatives
-# tangential to the faces
-check_macrocellfv_parabolic(mesh::TreeMesh{2}, ::LaplaceDiffusion2D) = nothing
-function check_macrocellfv_parabolic(mesh::TreeMesh{2}, equations_parabolic)
-    throw(ArgumentError("`MacroCellFV` in 2D supports only `LaplaceDiffusion2D` so far"))
+# In 2D, the isotropic diffusion (whose flux needs no derivatives along the faces) and
+# the compressible Navier-Stokes equations with primitive gradient variables
+check_macrocellfv_parabolic(mesh::TreeMesh{2}, ::LaplaceDiffusion2D, solver) = nothing
+# The derivatives along the faces (see `calc_tangential_derivatives!`) read the subcells
+# `g + 1 - R, ..., g + n + R` of the lines (radius `R` of the derivative stencils), which
+# must have been filled and transformed, and their one-sided stencils at the ends of the
+# face strips need `2 R + 2` lines
+function check_macrocellfv_parabolic(mesh::TreeMesh{2},
+                                     ::CompressibleNavierStokesDiffusion2D{GradientVariablesPrimitive},
+                                     solver)
+    volume_integral = solver.volume_integral
+    radius = tangential_radius(volume_integral)
+    radius in (1, 2) ||
+        throw(ArgumentError("`MacroCellFV` with the compressible Navier-Stokes " *
+                            "equations in 2D supports `GradientCentral` of order 2 " *
+                            "and 4 so far"))
+    n = nnodes(solver)
+    n >= 2 * radius + 2 ||
+        throw(ArgumentError("the derivatives along the faces need " *
+                            "`n_cells >= $(2 * radius + 2)`"))
+    # the first filled cell of the lines of the point values is 3, otherwise 2
+    a_first = has_point_values(volume_integral.moment_inversion) isa True ? 3 : 2
+    nhalo(solver) >= radius + a_first - 1 ||
+        throw(ArgumentError("the derivatives along the faces need " *
+                            "$(radius + a_first - 1) halo subcells; use a " *
+                            "reconstruction with a wider stencil"))
+    return nothing
+end
+function check_macrocellfv_parabolic(mesh::TreeMesh{2}, equations_parabolic, solver)
+    throw(ArgumentError("`MacroCellFV` in 2D supports only `LaplaceDiffusion2D` and " *
+                        "`CompressibleNavierStokesDiffusion2D` with " *
+                        "`GradientVariablesPrimitive` so far"))
 end
 
 # The fused right-hand side of the advective and diffusive terms
@@ -169,26 +196,90 @@ end
 
 # For the isotropic `LaplaceDiffusion2D`, the flux in the direction `orientation`
 # depends only on the derivative along this direction, so the tangential entry of the
-# gradients is zero.
-@inline function macrocell_gradients(gradient, orientation, ::LaplaceDiffusion2D)
-    zero_gradient = zero(gradient)
+# gradients is zero (no derivatives along the faces are computed).
+@inline function macrocell_gradients(dw_face, tw_face::Nothing, orientation,
+                                     ::LaplaceDiffusion2D)
+    zero_gradient = zero(dw_face)
     if orientation == 1
-        return (gradient, zero_gradient)
+        return (dw_face, zero_gradient)
     else
-        return (zero_gradient, gradient)
+        return (zero_gradient, dw_face)
     end
 end
 
-# Face transformation for the compressible Navier-Stokes equations (see
-# `face2flux_navier_stokes_primitive`): the diffusive flux takes the primitive gradient
-# variables `(rho, v1, T)`, with `T = (R T) / R` from the reconstruction variable `R T`
-@inline function macrocell_face2flux(::typeof(face2flux_navier_stokes_primitive), w_ll,
-                                     w_rr, w_face, dw_face, equations,
-                                     equations_parabolic::CompressibleNavierStokesDiffusion1D{GradientVariablesPrimitive})
+# The compressible Navier-Stokes equations need the derivatives along the faces
+# `tw_face` (see `calc_tangential_derivatives!`)
+@inline function macrocell_gradients(dw_face, tw_face, orientation,
+                                     ::CompressibleNavierStokesDiffusion2D)
+    if orientation == 1
+        return (dw_face, tw_face)
+    else
+        return (tw_face, dw_face)
+    end
+end
+
+# `True()` if the diffusive flux in one direction needs the derivatives along the
+# faces normal to it
+have_tangential_derivatives(equations_parabolic) = False()
+have_tangential_derivatives(::CompressibleNavierStokesDiffusion2D) = True()
+
+# Face transformations for the compressible Navier-Stokes equations with the
+# reconstruction variables `(rho, v1, [v2,] p, R T)` of `cons2prim_temperature_pressure`
+# (see `face2flux_navier_stokes_primitive`): the diffusive flux takes the primitive
+# gradient variables `(rho, v1, [v2,] T)`, with `T = (R T) / R` from the reconstruction
+# variable `R T`
+const Face2FluxNavierStokesPrimitive = Union{typeof(face2flux_navier_stokes_primitive),
+                                             typeof(face2flux_navier_stokes_prim2cons)}
+
+@inline function macrocell_face2flux(face2flux::Face2FluxNavierStokesPrimitive, w_ll,
+                                     w_rr, w_face, gradients, equations,
+                                     equations_parabolic::Union{CompressibleNavierStokesDiffusion1D{GradientVariablesPrimitive},
+                                                                CompressibleNavierStokesDiffusion2D{GradientVariablesPrimitive}})
     inv_R = inv(equations_parabolic.R)
-    u_diffusive = SVector(w_face[1], w_face[2], w_face[4] * inv_R)
-    gradient = SVector(dw_face[1], dw_face[2], dw_face[4] * inv_R)
-    return (face2flux_navier_stokes_primitive(w_ll, equations),
-            face2flux_navier_stokes_primitive(w_rr, equations), u_diffusive, gradient)
+    u_diffusive = navier_stokes_gradient_variables(w_face, inv_R, equations)
+    gradients_diffusive = map(gradient -> navier_stokes_gradient_variables(gradient,
+                                                                           inv_R,
+                                                                           equations),
+                              gradients)
+    return (face2flux(w_ll, equations), face2flux(w_rr, equations), u_diffusive,
+            gradients_diffusive)
+end
+
+# `(rho, v1, [v2,] T)` (or their derivatives) from `(rho, v1, [v2,] p, R T)`
+@inline function navier_stokes_gradient_variables(w, inv_R,
+                                                  ::CompressibleEulerEquations1D)
+    return SVector(w[1], w[2], w[4] * inv_R)
+end
+@inline function navier_stokes_gradient_variables(w, inv_R,
+                                                  ::CompressibleEulerEquations2D)
+    return SVector(w[1], w[2], w[3], w[5] * inv_R)
+end
+
+# Conservative reconstruction variables (`face2flux_navier_stokes_cons2prim`): the
+# primitive variables `(rho, v1, v2, T)` of the face state, and their derivatives from
+# those of the conservative variables `(rho, m1, m2, E)` by the chain rule,
+#   v = m / rho,           ∂v = (∂m - v ∂rho) / rho,
+#   p = (γ - 1) (E - rho |v|^2 / 2),
+#                          ∂p = (γ - 1) (∂E - |v|^2 ∂rho / 2 - rho v ⋅ ∂v),
+#   T = p / (R rho),       ∂T = (∂p - p / rho ∂rho) / (R rho)
+@inline function macrocell_face2flux(::typeof(face2flux_navier_stokes_cons2prim), w_ll,
+                                     w_rr, w_face, gradients,
+                                     equations::CompressibleEulerEquations2D,
+                                     equations_parabolic::CompressibleNavierStokesDiffusion2D{GradientVariablesPrimitive})
+    rho, v1, v2, p = cons2prim(w_face, equations)
+    inv_rho = inv(rho)
+    R = equations_parabolic.R
+    inv_R_rho = inv(R * rho)
+    u_diffusive = SVector(rho, v1, v2, p * inv_R_rho)
+    gradients_diffusive = map(gradients) do dw
+        d_rho, d_m1, d_m2, d_E = dw
+        d_v1 = (d_m1 - v1 * d_rho) * inv_rho
+        d_v2 = (d_m2 - v2 * d_rho) * inv_rho
+        d_p = (equations.gamma - 1) *
+              (d_E - 0.5f0 * (v1^2 + v2^2) * d_rho - rho * (v1 * d_v1 + v2 * d_v2))
+        d_T = (d_p - p * inv_rho * d_rho) * inv_R_rho
+        return SVector(d_rho, d_v1, d_v2, d_T)
+    end
+    return w_ll, w_rr, u_diffusive, gradients_diffusive
 end
 end # @muladd

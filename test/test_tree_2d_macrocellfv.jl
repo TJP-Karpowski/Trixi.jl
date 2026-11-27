@@ -160,7 +160,10 @@ end
         # cells read by the reconstruction are filled (no corner subcells): the result
         # does not depend on their previous content
         for buffers in (semi.cache.pad_x_threaded, semi.cache.pad_y_threaded,
-                        semi.cache.pad_points_threaded, semi.cache.face_flux_threaded,
+                        semi.cache.pad_points_x_threaded,
+                        semi.cache.pad_points_y_threaded,
+                        semi.cache.tangential_x_threaded,
+                        semi.cache.tangential_y_threaded, semi.cache.face_flux_threaded,
                         semi.cache.face_flux_average_threaded)
             foreach(buffer -> fill!(buffer, NaN), buffers)
         end
@@ -238,4 +241,142 @@ end
     @test log2(errors_points[1] / errors_points[2]) > 3.7
     errors_averages = vortex_errors(MomentInversionIdentity(), cons2cons, cons2cons)
     @test errors_averages[2] > 3 * errors_points[2]
+end
+
+@testitem "MacroCellFV 2D: elixir_navierstokes_convergence_periodic.jl" setup=[
+    Setup,
+    TreeMesh2DMacroCellFV
+] tags=[:tree_part1] begin
+    @test_trixi_include(joinpath(EXAMPLES_DIR,
+                                 "elixir_navierstokes_convergence_periodic.jl"),
+                        l2=[
+                            1.347014954619707e-5,
+                            0.0016457931334859777,
+                            0.0016415763807729124,
+                            0.002045876981800659
+                        ],
+                        linf=[
+                            5.3442985353147066e-5,
+                            0.003267658689079189,
+                            0.0032371920241385244,
+                            0.005255263958912959
+                        ],
+                        tspan=(0.0, 0.1))
+    @test_allocations(Trixi.rhs_macrocellfv!, semi, sol, ALLOCATION_LIMIT)
+end
+
+@testitem "MacroCellFV 2D: elixir_navierstokes_convergence_periodic.jl convergence" setup=[
+    Setup,
+    TreeMesh2DMacroCellFV
+] tags=[:tree_part1] begin
+    # Point values with fourth-order derivatives along and across the faces (order 4);
+    # conservative reconstruction of the averages with the chain rule for the gradients
+    # of the primitive variables (order 2)
+    muscl_c2 = CombinedScheme(ReconstructionMUSCL(), GradientCentral(2))
+    for (kwargs, order) in (((;), 4),
+                            ((; schemes = (muscl_c2, muscl_c2, muscl_c2, muscl_c2),
+                              moment_inversion = MomentInversionIdentity(),
+                              center2recon = cons2cons,
+                              face2flux = face2flux_navier_stokes_cons2prim), 2))
+        errors = map((2, 3)) do level
+            mod = Module()
+            trixi_include(mod,
+                          joinpath(EXAMPLES_DIR,
+                                   "elixir_navierstokes_convergence_periodic.jl");
+                          initial_refinement_level = level, tspan = (0.0, 0.25),
+                          analysis_interval = 10^6, kwargs...)
+            # The x-momentum (the density is constant in space)
+            sol = Base.invokelatest(getglobal, mod, :sol)
+            semi = Base.invokelatest(getglobal, mod, :semi)
+            u_exact = Base.invokelatest(Trixi.compute_coefficients, sol.t[end], semi)
+            difference = reshape(sol.u[end] - u_exact, 4, :)
+            sqrt(sum(abs2, difference[2, :]) / size(difference, 2))
+        end
+        @test log2(errors[1] / errors[2]) > order - 0.3
+    end
+end
+
+@testitem "MacroCellFV 2D: Navier-Stokes symmetry and conservation" setup=[
+    Setup,
+    TreeMesh2DMacroCellFV
+] tags=[:tree_part1] begin
+    # Swapping the coordinates and the velocity components of the initial condition
+    # transposes the right-hand side and swaps its momentum components (a test for
+    # mixed-up directions of the derivatives along the faces)
+    function initial_condition_x(x, t, equations)
+        rho = 1.5 + 0.2 * sinpi(x[1]) * cospi(2 * x[2])
+        v1 = 0.3 * cospi(x[2]) + 0.1 * sinpi(x[1] + x[2])
+        v2 = -0.2 * sinpi(2 * x[1]) * sinpi(x[2])
+        p = 2 + 0.3 * cospi(x[1]) * sinpi(x[2])
+        return prim2cons(SVector(rho, v1, v2, p), equations)
+    end
+    function initial_condition_y(x, t, equations)
+        u = initial_condition_x(SVector(x[2], x[1]), t, equations)
+        return SVector(u[1], u[3], u[2], u[4])
+    end
+    for (moment_inversion, center2recon, face2flux, schemes) in ((MomentInversionCentral(order = 4),
+                                                                  cons2prim_temperature_pressure,
+                                                                  face2flux_navier_stokes_prim2cons,
+                                                                  nothing),
+                                                                 (MomentInversionIdentity(),
+                                                                  cons2cons,
+                                                                  face2flux_navier_stokes_cons2prim,
+                                                                  ntuple(_ -> CombinedScheme(ReconstructionWENO5Z(),
+                                                                                             GradientCentral(4)),
+                                                                         4)))
+        results = map(((initial_condition_x, false), (initial_condition_y, true))) do (initial_condition,
+                                                                                       transpose)
+            mod = Module()
+            kwargs = schemes === nothing ? (;) : (; schemes)
+            trixi_include(mod,
+                          joinpath(EXAMPLES_DIR,
+                                   "elixir_navierstokes_convergence_periodic.jl");
+                          initial_condition, moment_inversion, center2recon, face2flux,
+                          source_terms = nothing,
+                          tspan = (0.0, 0.0), kwargs...)
+            semi = Base.invokelatest(getglobal, mod, :semi)
+            u_ode = Trixi.compute_coefficients(0.0, semi)
+            du_ode = similar(u_ode)
+            Trixi.rhs_macrocellfv!(du_ode, u_ode, semi, 0.0)
+            mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
+            coordinates = reshape(cache.elements.node_coordinates, 2, :)
+            order = sortperm(collect(eachcol(transpose ? coordinates[[2, 1], :] :
+                                             coordinates)))
+            du = reshape(du_ode, 4, :)[:, order]
+            if transpose
+                du = du[[1, 3, 2, 4], :]
+            end
+            du, du_ode
+        end
+        (du_x, du_ode), (du_y, _) = results
+        @test maximum(abs, du_x - du_y) < 1.0e-12
+        # Conservation of all variables
+        @test maximum(abs, sum(reshape(du_ode, 4, :), dims = 2)) < 1.0e-11
+    end
+end
+
+@testitem "MacroCellFV 2D: unsupported Navier-Stokes setups" setup=[
+    Setup,
+    TreeMesh2DMacroCellFV
+] tags=[:tree_part1] begin
+    # The error thrown while including the elixir (wrapped in a `LoadError`)
+    function include_error(; kwargs...)
+        try
+            trixi_include(Module(),
+                          joinpath(EXAMPLES_DIR,
+                                   "elixir_navierstokes_convergence_periodic.jl");
+                          tspan = (0.0, 0.0), kwargs...)
+        catch err
+            return err isa LoadError ? err.error : err
+        end
+        return nothing
+    end
+    # Derivatives along the faces of order 6 are not implemented yet
+    c6 = CombinedScheme(ReconstructionWENO5Z(), GradientCentral(6))
+    @test include_error(schemes = (c6, c6, c6, c6, c6)) isa ArgumentError
+    # The entropy variables as gradient variables are not supported
+    equations_parabolic = CompressibleNavierStokesDiffusion2D(CompressibleEulerEquations2D(1.4),
+                                                              mu = 0.01, Prandtl = 0.72,
+                                                              gradient_variables = GradientVariablesEntropy())
+    @test include_error(; equations_parabolic) isa ArgumentError
 end

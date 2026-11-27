@@ -57,17 +57,30 @@ function create_cache_volume_integral(mesh::TreeMesh{2}, equations,
                       for _ in 1:Threads.maxthreadid()]
     pad_y_threaded = [Array{uEltype, 3}(undef, n + 2 * g, n_pad, n + 2 * m)
                       for _ in 1:Threads.maxthreadid()]
-    # The pads of the point values (empty without moment inversion to point values)
+    # The pads of the point values, one per direction (empty without moment inversion
+    # to point values)
     n_points = has_point_values(moment_inversion) isa True ? n : 0
-    pad_points_threaded = [Array{uEltype, 3}(undef, n + 2 * g, n_pad, n_points)
-                           for _ in 1:Threads.maxthreadid()]
+    pad_points_x_threaded = [Array{uEltype, 3}(undef, n + 2 * g, n_pad, n_points)
+                             for _ in 1:Threads.maxthreadid()]
+    pad_points_y_threaded = [Array{uEltype, 3}(undef, n + 2 * g, n_pad, n_points)
+                             for _ in 1:Threads.maxthreadid()]
     n_recon = nreconvariables(volume_integral, equations)
     n_derivative = has_gradients(volume_integral) isa True ? n + 2 : 0
+    # With diffusion: the derivatives of the reconstruction variables across the lines
+    # of each direction at the subcell centers, `tangential_x[a, v, line]` with the same
+    # indices as the pads, and their values at the faces of a line, `tw_face[f, v]`
+    # (used only if the diffusive flux needs them, see `have_tangential_derivatives`)
+    n_tangential = has_gradients(volume_integral) isa True ? n : 0
+    tangential_x_threaded = [Array{uEltype, 3}(undef, n + 2 * g, n_recon, n_tangential)
+                             for _ in 1:Threads.maxthreadid()]
+    tangential_y_threaded = [Array{uEltype, 3}(undef, n + 2 * g, n_recon, n_tangential)
+                             for _ in 1:Threads.maxthreadid()]
     line_buffers_threaded = [(;
                               w_minus = Matrix{uEltype}(undef, n + 2, n_recon),
                               w_plus = Matrix{uEltype}(undef, n + 2, n_recon),
                               dw_minus = Matrix{uEltype}(undef, n_derivative, n_recon),
-                              dw_plus = Matrix{uEltype}(undef, n_derivative, n_recon))
+                              dw_plus = Matrix{uEltype}(undef, n_derivative, n_recon),
+                              tw_face = Matrix{uEltype}(undef, n_derivative, n_recon))
                              for _ in 1:Threads.maxthreadid()]
     # The fluxes at the faces normal to one direction, `face_flux[f, v, line]`, and
     # their face averages (with point values; see `face_point2average!`)
@@ -97,7 +110,8 @@ function create_cache_volume_integral(mesh::TreeMesh{2}, equations,
                                          real(dg))
     subcell_quadrature = (; nodes, weights)
 
-    return (; pad_x_threaded, pad_y_threaded, pad_points_threaded,
+    return (; pad_x_threaded, pad_y_threaded, pad_points_x_threaded,
+            pad_points_y_threaded, tangential_x_threaded, tangential_y_threaded,
             line_buffers_threaded, face_flux_threaded, face_flux_average_threaded,
             neighbor_elements, subcell_quadrature)
 end
@@ -142,7 +156,10 @@ function rhs_macrocellfv!(du, u, t, mesh::TreeMesh{2}, equations, equations_para
             thread = Threads.threadid()
             buffers = (; pad_x = cache.pad_x_threaded[thread],
                        pad_y = cache.pad_y_threaded[thread],
-                       pad_points = cache.pad_points_threaded[thread],
+                       pad_points_x = cache.pad_points_x_threaded[thread],
+                       pad_points_y = cache.pad_points_y_threaded[thread],
+                       tangential_x = cache.tangential_x_threaded[thread],
+                       tangential_y = cache.tangential_y_threaded[thread],
                        line_buffers = cache.line_buffers_threaded[thread],
                        face_flux = cache.face_flux_threaded[thread],
                        face_flux_average = cache.face_flux_average_threaded[thread])
@@ -163,20 +180,41 @@ end
 
 # All faces of `element` except those at -x and -y: the faces inside the macro-cell
 # and the faces at +x and +y (stored for both adjacent elements in
-# `surface_flux_values`). The flux differences of the x-lines are stored in `du`, those
-# of the y-lines are added; the subcells next to the faces at -x and -y miss the fluxes
-# at these faces until `finish_macrocell_faces!`.
-function calc_macrocell_element!(du, buffers, u, t, element, source_terms,
+# `surface_flux_values`). The steps are
+#   1. gather the subcells and the face strips of the neighbors into the pads of both
+#      directions,
+#   2. moment inversion (point values) and transformation to the reconstruction
+#      variables of the lines of both pads,
+#   3. if the diffusive flux needs them: the derivatives across the lines of each
+#      direction (along the faces normal to it, see `calc_tangential_derivatives!`),
+#   4. the faces of the x-lines and of the y-lines (`calc_macrocell_direction!`).
+# The flux differences of the x-lines are stored in `du`, those of the y-lines are
+# added; the subcells next to the faces at -x and -y miss the fluxes at these faces
+# until `finish_macrocell_faces!`.
+function calc_macrocell_element!(du, buffers, u, t, element, source_terms::Source,
                                  mesh::TreeMesh{2}, equations, equations_parabolic,
-                                 volume_integral, dg::MacroCellFV, cache)
-    @unpack pad_x, pad_y = buffers
+                                 volume_integral, dg::MacroCellFV,
+                                 cache) where {Source}
+    @unpack pad_x, pad_y, pad_points_x, pad_points_y = buffers
     inv_h = inv_subcell_width(mesh, dg, cache, element)
 
     gather_pads!(pad_x, pad_y, u, element, volume_integral.moment_inversion,
                  equations, dg, cache)
-    calc_macrocell_direction!(du, pad_x, buffers, element, inv_h, Val(1), equations,
+    # The pads read by the reconstruction (lines `line + offset`, filled cells
+    # `a_first:a_last`)
+    pads_x, offset, a_first, a_last = prepare_pad_2d!(pad_points_x, pad_x,
+                                                      volume_integral, equations, dg)
+    pads_y, _ = prepare_pad_2d!(pad_points_y, pad_y, volume_integral, equations, dg)
+
+    tangential = have_tangential_derivatives(equations_parabolic)
+    calc_tangential_derivatives!(buffers, pads_x, pads_y, offset, tangential,
+                                 volume_integral, equations, dg)
+
+    calc_macrocell_direction!(du, pads_x, offset, buffers.tangential_x, tangential,
+                              buffers, element, inv_h, Val(1), equations,
                               equations_parabolic, volume_integral, dg, cache)
-    calc_macrocell_direction!(du, pad_y, buffers, element, inv_h, Val(2), equations,
+    calc_macrocell_direction!(du, pads_y, offset, buffers.tangential_y, tangential,
+                              buffers, element, inv_h, Val(2), equations,
                               equations_parabolic, volume_integral, dg, cache)
 
     add_macrocell_source_terms!(du, u, t, source_terms, element, inv_h, mesh, equations,
@@ -185,40 +223,56 @@ function calc_macrocell_element!(du, buffers, u, t, element, source_terms,
     return nothing
 end
 
+# Moment inversion of the lines of `pad` (point values in `pad_points`) and
+# transformation of the filled cells to the reconstruction variables. Returns the pads
+# read by the reconstruction, the offset of the line indices in them, and the range of
+# their filled cells along the lines.
+@inline function prepare_pad_2d!(pad_points, pad, volume_integral, equations, dg)
+    @unpack moment_inversion, center2recon = volume_integral
+    line_pads, offset, a_first, a_last = pad_moment_inversion_2d!(pad_points, pad,
+                                                                  moment_inversion,
+                                                                  nhalo(dg), equations,
+                                                                  dg)
+    for line in eachnode(dg)
+        pad_center2recon!(view(line_pads, :, :, line + offset), a_first, a_last,
+                          center2recon, equations)
+    end
+    return line_pads, offset, a_first, a_last
+end
+
 # The faces normal to the direction `orientation` of `element` (except those at its
-# -x or -y side) from the lines of `pad` in this direction:
-#   1. moment inversion of the lines (point values in `pad_points`),
-#   2. transformation to the reconstruction variables, face reconstruction, and fluxes
-#      at the faces of each line, stored in `face_flux[f, v, line]`,
-#   3. with point values: conversion of the point fluxes at the face midpoints to face
+# -x or -y side) from the lines of `line_pads` (reconstruction variables) in this
+# direction:
+#   1. face reconstruction, (if needed) the derivatives along the faces, and fluxes at
+#      the faces of each line, stored in `face_flux[f, v, line]`,
+#   2. with point values: conversion of the point fluxes at the face midpoints to face
 #      averages along the faces (`face_point2average!`),
-#   4. flux differences (stored for `orientation = 1`, added for `orientation = 2`) and
+#   3. flux differences (stored for `orientation = 1`, added for `orientation = 2`) and
 #      the fluxes at the faces at +x or +y for both adjacent elements.
-# The first filled pad cell is `a = 2`, since the face at the minus side is computed by
-# the neighbor there, so the reconstruction starts at the subcell 1.
-function calc_macrocell_direction!(du, pad, buffers, element, inv_h,
+# The reconstruction starts at the subcell 1, since the face at the minus side is
+# computed by the neighbor there.
+function calc_macrocell_direction!(du, line_pads, offset, tangential_derivatives,
+                                   tangential, buffers, element, inv_h,
                                    orientation::Val{Orientation}, equations,
                                    equations_parabolic, volume_integral,
                                    dg::MacroCellFV, cache) where {Orientation}
-    @unpack pad_points, line_buffers, face_flux, face_flux_average = buffers
-    @unpack moment_inversion, center2recon = volume_integral
+    @unpack face_flux, face_flux_average = buffers
+    line_buffers = line_buffers_2d(buffers.line_buffers, tangential)
     g = nhalo(dg)
     n = nnodes(dg)
     n_recon = Val(nreconvariables(volume_integral, equations))
 
-    line_pads, offset, a_first, a_last = pad_moment_inversion_2d!(pad_points, pad,
-                                                                  moment_inversion, g,
-                                                                  equations, dg)
     for line in eachnode(dg)
         line_pad = view(line_pads, :, :, line + offset)
-        pad_center2recon!(line_pad, a_first, a_last, center2recon, equations)
         reconstruct_line!(line_buffers, line_pad, volume_integral, 1, n + 1, g, n_recon)
+        tangential_face_derivatives!(line_buffers, tangential_derivatives, line,
+                                     tangential, volume_integral, n_recon, g, n)
         calc_line_fluxes!(view(face_flux, :, :, line), line_buffers, 2, n + 1, inv_h,
                           Orientation, equations, equations_parabolic, volume_integral)
     end
 
-    flux = face_point2average!(face_flux_average, face_flux, moment_inversion, 2, n + 1,
-                               equations)
+    flux = face_point2average!(face_flux_average, face_flux,
+                               volume_integral.moment_inversion, 2, n + 1, equations)
     add_flux_differences!(du, flux, element, inv_h, orientation, equations, dg)
 
     @unpack surface_flux_values = cache.elements
@@ -230,6 +284,14 @@ function calc_macrocell_direction!(du, pad, buffers, element, inv_h,
     end
 
     return nothing
+end
+
+# The line buffers passed to the line kernels: with the derivatives along the faces
+# only if the diffusive flux needs them (otherwise, `tw_face` is not read)
+@inline line_buffers_2d(line_buffers, ::True) = line_buffers
+@inline function line_buffers_2d(line_buffers, ::False)
+    @unpack w_minus, w_plus, dw_minus, dw_plus = line_buffers
+    return (; w_minus, w_plus, dw_minus, dw_plus)
 end
 
 # Flux differences of the faces normal to x (stored) or y (added); the subcells next to
@@ -462,6 +524,219 @@ end
     return nothing
 end
 
+#####################################################################
+# Derivatives along the faces (tangential derivatives) for the diffusive fluxes
+#
+# The viscous fluxes of the compressible Navier-Stokes equations at a face normal to x
+# need the y-derivatives of the velocity and the temperature there. They are the
+# interpolation along the x-line of the y-derivatives at the subcell centers (I_x C_y):
+# - the subcells of the macro-cell take the y-derivatives along the y-lines, whose pad
+#   holds the halo subcells in y of the macro-cell (central stencils),
+# - the halo subcells of the x-lines (in the face strips of the neighbors at -x and +x)
+#   take them across the x-lines of the strip; there are no corner subcells, so at the
+#   ends of the strip the stencils are one-sided, and one order more accurate than the
+#   central ones, since the flux differences differentiate the jump between the
+#   one-sided and the central derivatives once more.
+# The order (2 or 4) is that of the `GradientCentral` stencils of the face derivatives
+# (radius `R = order / 2`).
+
+# The weights of the first derivative at offset 0 from the values at `offsets` (exact for
+# polynomials of degree `length(offsets) - 1`, rational arithmetic)
+function first_derivative_weights(offsets)
+    m = length(offsets)
+    A = [Rational{BigInt}(offset)^p for p in 0:(m - 1), offset in offsets]
+    b = zeros(Rational{BigInt}, m)
+    b[2] = 1
+    return Tuple(Float64.(A \ b))
+end
+
+# Central weights of radius `R` (offsets `-R:R`), and the one-sided weights for the
+# first `R` lines (line `j` with offsets `(1 - j):(2 R + 2 - j)`, exact for polynomials
+# of degree `2 R + 1`)
+const TANGENTIAL_CENTRAL_WEIGHTS = (first_derivative_weights(-1:1),
+                                    first_derivative_weights(-2:2))
+const TANGENTIAL_CLOSURE_WEIGHTS = ((first_derivative_weights(0:3),),
+                                    (first_derivative_weights(0:5),
+                                     first_derivative_weights(-1:4)))
+
+# The radius of the central derivative stencils of the face derivatives (0 without)
+@inline gradient_radius(scheme) = 0
+@inline gradient_radius(::CombinedScheme{<:Any, GradientCentral{M}}) where {M} = M
+@inline function tangential_radius(volume_integral::VolumeIntegralMacroCellFV)
+    @unpack reconstruction, schemes = volume_integral
+    schemes === nothing && return gradient_radius(reconstruction)
+    return maximum(gradient_radius, schemes)
+end
+
+# Call `func(v)` for each reconstruction variable `v` with face derivatives (unrolled,
+# so that the scheme of each variable is known at compile time)
+@inline function foreach_gradient_variable(func::F, volume_integral,
+                                           ::Val{NRecon}) where {F, NRecon}
+    ntuple(Val(NRecon)) do v
+        if has_gradient(pad_scheme(volume_integral, v)) isa True
+            func(v)
+        end
+        return nothing
+    end
+    return nothing
+end
+
+@inline function calc_tangential_derivatives!(buffers, pads_x, pads_y, offset, ::False,
+                                              volume_integral, equations, dg)
+    return nothing
+end
+
+@inline function calc_tangential_derivatives!(buffers, pads_x, pads_y, offset, ::True,
+                                              volume_integral, equations, dg)
+    @unpack tangential_x, tangential_y = buffers
+    g = nhalo(dg)
+    n = nnodes(dg)
+    radius = tangential_radius(volume_integral)
+    n_recon = Val(nreconvariables(volume_integral, equations))
+    foreach_gradient_variable(TangentialDerivatives(tangential_x, tangential_y, pads_x,
+                                                    pads_y, offset, radius, g, n),
+                              volume_integral, n_recon)
+    return nothing
+end
+
+# The derivatives (per subcell width) of the variable `v` across the lines of `pad`
+# (e.g., the y-derivatives for the x-lines) at the subcell centers
+# `a = g + 2 - R, ..., g + n + R` of the lines, which the interpolation to the faces
+# `2, ..., n + 1` reads. `pad_other` holds the lines of the other direction.
+@noinline function tangential_derivatives_variable!(tangential, pad, pad_other, offset,
+                                                    v, ::Val{R}, g, n) where {R}
+    RealT = eltype(tangential)
+    central = map(w -> convert(RealT, w), TANGENTIAL_CENTRAL_WEIGHTS[R])
+    # The subcells of the macro-cell: central, along the lines of the other direction
+    # (subcell `(a, line)` of `pad` is subcell `(g + line, a - g)` of `pad_other`)
+    @inbounds for line_other in 1:n
+        a = g + line_other
+        for line in 1:n
+            d = zero(RealT)
+            for k in (-R):R
+                d = d +
+                    central[k + R + 1] * pad_other[g + line + k, v, line_other + offset]
+            end
+            tangential[a, v, line] = d
+        end
+    end
+    # The halo subcells (face strips of the neighbors): across the lines of `pad`
+    for line in 1:n
+        if R < line <= n - R
+            for range in ((g + 2 - R):g, (g + n + 1):(g + n + R))
+                @inbounds @simd ivdep for a in range
+                    d = zero(RealT)
+                    for k in (-R):R
+                        d = d + central[k + R + 1] * pad[a, v, line + k + offset]
+                    end
+                    tangential[a, v, line] = d
+                end
+            end
+        else
+            # One-sided: from the first or the last line of the strip
+            j = line <= R ? line : n + 1 - line
+            weights = map(w -> convert(RealT, w), TANGENTIAL_CLOSURE_WEIGHTS[R][j])
+            sign = line <= R ? 1 : -1
+            for range in ((g + 2 - R):g, (g + n + 1):(g + n + R))
+                @inbounds @simd ivdep for a in range
+                    d = zero(RealT)
+                    for (q, w) in enumerate(weights)
+                        # offsets `(1 - j):(2 R + 2 - j)`, mirrored at the last line
+                        k = sign * (q - j)
+                        d = d + sign * w * pad[a, v, line + k + offset]
+                    end
+                    tangential[a, v, line] = d
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# The derivatives along the faces `2, ..., n + 1` of the line `line` (interpolation of
+# the derivatives at the subcell centers along the line, of the order of the stencils),
+# stored in `line_buffers.tw_face[f, v]`
+@inline function tangential_face_derivatives!(line_buffers, tangential, line, ::False,
+                                              volume_integral, n_recon, g, n)
+    return nothing
+end
+
+@inline function tangential_face_derivatives!(line_buffers, tangential, line, ::True,
+                                              volume_integral, n_recon, g, n)
+    @unpack tw_face = line_buffers
+    radius = tangential_radius(volume_integral)
+    foreach_gradient_variable(InterpolateTangential(tw_face, tangential, line, radius,
+                                                    g,
+                                                    n),
+                              volume_integral, n_recon)
+    return nothing
+end
+
+# (callable structs instead of closures, which captured variables in boxes)
+struct InterpolateTangential{TW, T}
+    tw_face::TW
+    tangential::T
+    line::Int
+    radius::Int
+    g::Int
+    n::Int
+end
+@inline function (f::InterpolateTangential)(v)
+    interpolate_tangential_line!(f.tw_face, f.tangential, f.line, v, f.radius, f.g, f.n)
+end
+
+struct TangentialDerivatives{TX, TY, PX, PY}
+    tangential_x::TX
+    tangential_y::TY
+    pads_x::PX
+    pads_y::PY
+    offset::Int
+    radius::Int
+    g::Int
+    n::Int
+end
+@inline function (f::TangentialDerivatives)(v)
+    @unpack tangential_x, tangential_y, pads_x, pads_y, offset, g, n = f
+    if f.radius == 1
+        tangential_derivatives_variable!(tangential_x, pads_x, pads_y, offset, v,
+                                         Val(1),
+                                         g, n)
+        tangential_derivatives_variable!(tangential_y, pads_y, pads_x, offset, v,
+                                         Val(1),
+                                         g, n)
+    else
+        tangential_derivatives_variable!(tangential_x, pads_x, pads_y, offset, v,
+                                         Val(2),
+                                         g, n)
+        tangential_derivatives_variable!(tangential_y, pads_y, pads_x, offset, v,
+                                         Val(2),
+                                         g, n)
+    end
+    return nothing
+end
+
+@noinline function interpolate_tangential_line!(tw_face, tangential, line, v, radius, g,
+                                                n)
+    RealT = eltype(tw_face)
+    if radius == 1
+        @inbounds @simd ivdep for f in 2:(n + 1)
+            tw_face[f, v] = 0.5f0 * (tangential[g + f - 1, v, line] +
+                             tangential[g + f, v, line])
+        end
+    else
+        # (-1, 9, 9, -1) / 16
+        w = inv(convert(RealT, 16))
+        @inbounds @simd ivdep for f in 2:(n + 1)
+            tw_face[f, v] = w *
+                            (9 * (tangential[g + f - 1, v, line] +
+                              tangential[g + f, v, line]) -
+                             (tangential[g + f - 2, v, line] +
+                              tangential[g + f + 1, v, line]))
+        end
+    end
+    return nothing
+end
+
 # Source terms: the averages of the source terms over the subcells (tensor-product
 # Gauss-Legendre quadrature of `initial_condition_nodes` per direction, with the subcell
 # average as state)
@@ -479,20 +754,37 @@ end
     return nothing
 end
 
-@noinline function add_macrocell_source_terms_2d!(du, u, t, source_terms, element,
-                                                  inv_h, equations, dg, cache)
+@noinline function add_macrocell_source_terms_2d!(du, u, t, source_terms::Source,
+                                                  element,
+                                                  inv_h, equations, dg,
+                                                  cache) where {Source}
     h = inv(inv_h)
     for j in eachnode(dg), i in eachnode(dg)
         u_local = get_node_vars(u, equations, dg, i, j, element)
         x_c = get_node_coords(cache.elements.node_coordinates, equations, dg, i, j,
                               element)
-        source = subcell_average(cache.subcell_quadrature, x_c, h) do x
-            return source_terms(u_local, x, t, equations)
-        end
+        source = subcell_average(SourceAt(source_terms, u_local, t, equations),
+                                 cache.subcell_quadrature, x_c, h)
         add_to_node_vars!(du, source, equations, dg, i, j, element)
     end
     return nothing
 end
+
+# `source_terms(u, x, t, equations)` and `func(x, t, equations)` as functions of `x`
+struct SourceAt{S, U, T, E}
+    source_terms::S
+    u::U
+    t::T
+    equations::E
+end
+@inline (f::SourceAt)(x) = f.source_terms(f.u, x, f.t, f.equations)
+
+struct InitialConditionAt{F, T, E}
+    func::F
+    t::T
+    equations::E
+end
+@inline (f::InitialConditionAt)(x) = f.func(x, f.t, f.equations)
 
 # Average of `func(x)` over the square subcell with center `x_c` and width `h` by the
 # tensor-product Gauss-Legendre `quadrature` on [-1, 1]
@@ -510,9 +802,7 @@ end
 # Polyester.jl)
 @inline function initial_condition_subcell_average(func::F, quadrature, x_c, h, t,
                                                    equations) where {F}
-    return subcell_average(quadrature, x_c, h) do x
-        return func(x, t, equations)
-    end
+    return subcell_average(InitialConditionAt(func, t, equations), quadrature, x_c, h)
 end
 
 # Initial condition: point values at the subcell centers (as for all DG solvers) or

@@ -194,6 +194,15 @@ with the same (one-dimensional) reconstruction and face derivatives:
   fourth-order accurate also for nonlinear fluxes. No corner subcells are needed: at
   the ends of the face strips of the neighbors, the moment inversion and the
   conversion use one-sided stencils.
+- The viscous fluxes of [`CompressibleNavierStokesDiffusion2D`](@ref) (with
+  `GradientVariablesPrimitive`) also need the derivatives along the faces. They are
+  interpolated along the lines from the derivatives across the lines at the subcell
+  centers (central stencils of the order of the [`GradientCentral`](@ref) schemes, 2 or
+  4; one-sided at the ends of the face strips of the neighbors). Use either the point
+  values of `cons2prim_temperature_pressure` with
+  [`face2flux_navier_stokes_prim2cons`](@ref), or the conservative variables
+  (`center2recon = cons2cons`, all variables with face derivatives) with
+  [`face2flux_navier_stokes_cons2prim`](@ref) (second order).
 
 - `surface_flux`: numerical flux at the subcell faces, e.g.,
   [`flux_lax_friedrichs`](@ref) or [`flux_hllc`](@ref).
@@ -403,39 +412,46 @@ end
 
 # Advective-diffusive flux at a subcell face: the numerical flux of the reconstructed
 # states `w_ll`, `w_rr` minus the diffusive flux of the face state `w_face` (the mean of
-# the two states) and the derivatives `dw_face` of the reconstruction variables
-@inline function macrocell_face_flux(w_ll, w_rr, w_face, dw_face, orientation,
+# the two states), the derivatives `dw_face` of the reconstruction variables along the
+# face normal, and (in 2D, if needed by `equations_parabolic`) their derivatives
+# `tw_face` along the face (`nothing` otherwise)
+@inline function macrocell_face_flux(w_ll, w_rr, w_face, dw_face, tw_face, orientation,
                                      equations, equations_parabolic,
                                      volume_integral::VolumeIntegralMacroCellFV)
     @unpack surface_flux, face2flux = volume_integral
 
-    u_ll, u_rr, u_diffusive, gradient = macrocell_face2flux(face2flux, w_ll, w_rr,
-                                                            w_face, dw_face,
-                                                            equations,
-                                                            equations_parabolic)
+    # The gradients of the reconstruction variables, one per coordinate direction
+    gradients_recon = macrocell_gradients(dw_face, tw_face, orientation,
+                                          equations_parabolic)
+    u_ll, u_rr, u_diffusive, gradients = macrocell_face2flux(face2flux, w_ll, w_rr,
+                                                             w_face, gradients_recon,
+                                                             equations,
+                                                             equations_parabolic)
     flux_advective = surface_flux(u_ll, u_rr, orientation, equations)
-    gradients = macrocell_gradients(gradient, orientation, equations_parabolic)
     flux_diffusive = flux(u_diffusive, gradients, orientation, equations_parabolic)
 
     return flux_advective - flux_diffusive
 end
 
-# The gradients of the diffusive flux (one entry per coordinate direction) from the
-# derivatives along the face normal `orientation`. In 1D, only the normal derivative
+# The gradients (one entry per coordinate direction) from the derivatives along the
+# face normal `orientation` and along the face. In 1D, only the normal derivative
 # exists; for 2D, see `macrocellfv_parabolic.jl`.
-@inline macrocell_gradients(gradient, orientation, ::AbstractEquationsParabolic{1}) = (gradient,)
+@inline function macrocell_gradients(dw_face, tw_face, orientation,
+                                     ::AbstractEquationsParabolic{1})
+    return (dw_face,)
+end
 
 """
-    macrocell_face2flux(face2flux, w_ll, w_rr, w_face, dw_face,
+    macrocell_face2flux(face2flux, w_ll, w_rr, w_face, gradients,
                         equations, equations_parabolic)
 
 Transformation of the reconstruction variables at a subcell face of
 [`MacroCellFV`](@ref) with diffusion: from the reconstructed states `w_ll` and `w_rr`,
-the face state `w_face` (their mean) and the derivatives `dw_face` of the
-reconstruction variables along the face normal (zero for the variables without
-derivatives), return `(u_ll, u_rr, u_diffusive, gradient)`: the states of the numerical
-flux `surface_flux(u_ll, u_rr, orientation, equations)` and the state and the gradient
-of the diffusive flux `flux(u_diffusive, (gradient,), orientation,
+the face state `w_face` (their mean) and the `gradients` of the reconstruction variables
+(a tuple with one entry per coordinate direction; zero for the variables without
+derivatives), return `(u_ll, u_rr, u_diffusive, gradients_diffusive)`: the states of
+the numerical flux `surface_flux(u_ll, u_rr, orientation, equations)` and the state and
+the gradients of the diffusive flux `flux(u_diffusive, gradients_diffusive, orientation,
 equations_parabolic)` (in the gradient variables of `equations_parabolic`).
 
 The default uses `face2flux(w, equations)` for the states of the numerical flux and the
@@ -447,9 +463,9 @@ for the type of `face2flux` for other variables, see
 !!! warning "Experimental code"
     This code is experimental and may change in any future release.
 """
-@inline function macrocell_face2flux(face2flux, w_ll, w_rr, w_face, dw_face, equations,
-                                     equations_parabolic)
-    return face2flux(w_ll, equations), face2flux(w_rr, equations), w_face, dw_face
+@inline function macrocell_face2flux(face2flux, w_ll, w_rr, w_face, gradients,
+                                     equations, equations_parabolic)
+    return face2flux(w_ll, equations), face2flux(w_rr, equations), w_face, gradients
 end
 
 """
@@ -471,6 +487,12 @@ variables, e.g., [`flux_hllc_primitive`](@ref).
     return SVector(rho, v1, p, p / rho)
 end
 
+@inline function cons2prim_temperature_pressure(u,
+                                                equations::CompressibleEulerEquations2D)
+    rho, v1, v2, p = cons2prim(u, equations)
+    return SVector(rho, v1, v2, p, p / rho)
+end
+
 """
     face2flux_navier_stokes_primitive(w, equations)
 
@@ -486,7 +508,44 @@ Only the velocity and the temperature need face derivatives
 !!! warning "Experimental code"
     This code is experimental and may change in any future release.
 """
-@inline function face2flux_navier_stokes_primitive(w, equations)
+@inline function face2flux_navier_stokes_primitive(w,
+                                                   equations::CompressibleEulerEquations1D)
     return SVector(w[1], w[2], w[3])
 end
+
+@inline function face2flux_navier_stokes_primitive(w,
+                                                   equations::CompressibleEulerEquations2D)
+    return SVector(w[1], w[2], w[3], w[4])
+end
+
+"""
+    face2flux_navier_stokes_prim2cons(w, equations)
+
+Face transformation of [`MacroCellFV`](@ref) for the reconstruction variables
+`(rho, v1, [v2,] p, R T)` of [`cons2prim_temperature_pressure`](@ref): the conservative
+variables for any numerical flux of Trixi.jl. With diffusion, the state and the gradients
+of the diffusive flux are those of [`face2flux_navier_stokes_primitive`](@ref).
+
+!!! warning "Experimental code"
+    This code is experimental and may change in any future release.
+"""
+@inline function face2flux_navier_stokes_prim2cons(w, equations)
+    return prim2cons(face2flux_navier_stokes_primitive(w, equations), equations)
+end
+
+"""
+    face2flux_navier_stokes_cons2prim(w, equations)
+
+Face transformation of [`MacroCellFV`](@ref) for the compressible Navier-Stokes equations
+with the conservative variables as reconstruction variables (`center2recon = cons2cons`,
+all variables with face derivatives): the numerical flux takes the conservative
+variables, the diffusive flux the primitive variables `(rho, v1, [v2,] T)` of the face
+state and their gradients, which are computed from the derivatives of the conservative
+variables by the chain rule. Since the face values and derivatives of the subcell
+averages are face averages, this is second-order accurate.
+
+!!! warning "Experimental code"
+    This code is experimental and may change in any future release.
+"""
+@inline face2flux_navier_stokes_cons2prim(w, equations) = w
 end # @muladd
