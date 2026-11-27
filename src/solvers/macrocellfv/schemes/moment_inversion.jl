@@ -124,7 +124,8 @@ end
 @inline macrocell_point_value_admissible(u, equations) = true
 
 @inline function macrocell_point_value_admissible(u,
-                                                  equations::CompressibleEulerEquations1D)
+                                                  equations::Union{CompressibleEulerEquations1D,
+                                                                   CompressibleEulerEquations2D})
     return u[1] > 0 && pressure(u, equations) > 0
 end
 end # @muladd

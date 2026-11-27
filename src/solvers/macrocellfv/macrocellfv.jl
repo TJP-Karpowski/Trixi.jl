@@ -180,13 +180,20 @@ subcells per coordinate direction in each element (macro-cell) of the mesh, with
 reconstruction of the face states. As for [`BlockFV`](@ref), the subcells
 are stored with a [`UniformFiniteVolumeBasis`](@ref); for consistency with `BlockFV`,
 the number of subcells can also be given as `n_nodes`. Currently supported on the 1D
-and 2D [`TreeMesh`](@ref); in 2D only on periodic meshes without mortars and with
-`MomentInversionIdentity` so far. In 2D, the faces normal to x and to y are computed
-along the x- and y-lines of subcells with the same (one-dimensional) reconstruction and
-face derivatives. Of the subcell averages, they give the face averages of the states and
-of the normal derivatives, so the scheme keeps the order of the stencils for linear
-fluxes (e.g., linear advection with [`LaplaceDiffusion2D`](@ref)) and is second-order
-accurate for nonlinear fluxes.
+and 2D [`TreeMesh`](@ref); in 2D only on periodic meshes without mortars so far. In
+2D, the faces normal to x and to y are computed along the x- and y-lines of subcells
+with the same (one-dimensional) reconstruction and face derivatives:
+- With `MomentInversionIdentity`, they act on the subcell averages and give the face
+  averages of the states and of the normal derivatives, so the scheme keeps the order
+  of the stencils for linear fluxes (e.g., linear advection with
+  [`LaplaceDiffusion2D`](@ref)) but is second-order accurate for nonlinear fluxes.
+- With `MomentInversionCentral(order = 4)` (the only moment inversion to point values
+  in 2D so far, `n_cells >= 5`), they act on the point values at the subcell centers
+  and give point values at the face midpoints. The numerical fluxes there are
+  converted to face averages along the faces (fourth order), so the scheme is
+  fourth-order accurate also for nonlinear fluxes. No corner subcells are needed: at
+  the ends of the face strips of the neighbors, the moment inversion and the
+  conversion use one-sided stencils.
 
 - `surface_flux`: numerical flux at the subcell faces, e.g.,
   [`flux_lax_friedrichs`](@ref) or [`flux_hllc`](@ref).

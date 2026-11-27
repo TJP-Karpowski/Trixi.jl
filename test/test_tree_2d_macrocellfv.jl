@@ -88,17 +88,26 @@ end
     # face averages of the linear fluxes to the order of the stencils: WENO5-Z with
     # sixth-order derivatives (order 5), central values and derivatives of order 4,
     # MUSCL with second-order derivatives
-    for (reconstruction, order) in ((CombinedScheme(ReconstructionWENO5Z(),
-                                                    GradientCentral(6)), 5),
-                                    (CombinedScheme(ReconstructionCentral(4),
-                                                    GradientCentral(4)), 4),
-                                    (CombinedScheme(ReconstructionMUSCL(),
-                                                    GradientCentral(2)), 2))
+    # With point values (fourth-order moment inversion and conversion of the face
+    # fluxes to face averages): order 4
+    for (reconstruction, moment_inversion, order) in ((CombinedScheme(ReconstructionWENO5Z(),
+                                                                      GradientCentral(6)),
+                                                       MomentInversionIdentity(), 5),
+                                                      (CombinedScheme(ReconstructionCentral(4),
+                                                                      GradientCentral(4)),
+                                                       MomentInversionIdentity(), 4),
+                                                      (CombinedScheme(ReconstructionMUSCL(),
+                                                                      GradientCentral(2)),
+                                                       MomentInversionIdentity(), 2),
+                                                      (CombinedScheme(ReconstructionWENO5Z(),
+                                                                      GradientCentral(4)),
+                                                       MomentInversionCentral(order = 4),
+                                                       4))
         errors = map((2, 3)) do level
             mod = Module()
             trixi_include(mod, joinpath(EXAMPLES_DIR, "elixir_advection_diffusion.jl");
                           initial_refinement_level = level, tspan = (0.0, 0.25),
-                          reconstruction, diffusivity = 0.1,
+                          reconstruction, moment_inversion, diffusivity = 0.1,
                           advection_velocity = (0.1, 0.05), analysis_interval = 10^6,
                           stepsize_callback = StepsizeCallback(cfl = 0.2,
                                                                cfl_parabolic = 0.1))
@@ -119,11 +128,12 @@ end
                                                    0.1 * sinpi(3 * x[2]))
     initial_condition_y(x, t, equations) = initial_condition_x(SVector(x[2], x[1]), t,
                                                                equations)
-    function rhs_transposed(initial_condition, advection_velocity, transpose)
+    function rhs_transposed(initial_condition, advection_velocity, transpose,
+                            moment_inversion)
         mod = Module()
         trixi_include(mod, joinpath(EXAMPLES_DIR, "elixir_advection_diffusion.jl");
-                      initial_condition, advection_velocity, initial_refinement_level = 2,
-                      tspan = (0.0, 0.0))
+                      initial_condition, advection_velocity, moment_inversion,
+                      initial_refinement_level = 2, tspan = (0.0, 0.0))
         semi = Base.invokelatest(getglobal, mod, :semi)
         u_ode = Trixi.compute_coefficients(0.0, semi)
         du_ode = similar(u_ode)
@@ -133,30 +143,33 @@ end
         coordinates = reshape(cache.elements.node_coordinates, 2, :)
         order = sortperm(collect(eachcol(transpose ? coordinates[[2, 1], :] :
                                          coordinates)))
-        return du_ode[order], du_ode
+        return du_ode[order], du_ode, u_ode, semi
     end
-    du_x, du_ode = rhs_transposed(initial_condition_x, (0.7, -0.4), false)
-    du_y, _ = rhs_transposed(initial_condition_y, (-0.4, 0.7), true)
-    @test maximum(abs, du_x - du_y) < 1.0e-13
-    # Conservation: the fluxes at the faces at -x and -y are those of the neighbors
-    @test abs(sum(du_ode)) < 1.0e-12
+    # Averages and point values (moment inversion and conversion of the face fluxes)
+    for moment_inversion in (MomentInversionIdentity(),
+                             MomentInversionCentral(order = 4))
+        du_x, du_ode, u_ode, semi = rhs_transposed(initial_condition_x, (0.7, -0.4),
+                                                   false, moment_inversion)
+        du_y, _ = rhs_transposed(initial_condition_y, (-0.4, 0.7), true,
+                                 moment_inversion)
+        @test maximum(abs, du_x - du_y) < 1.0e-13
+        # Conservation: the fluxes at the faces at -x and -y are those of the neighbors
+        @test abs(sum(du_ode)) < 1.0e-12
 
-    # The pads of the threads are reused for all elements, and only the pad cells read
-    # by the reconstruction are filled: the result does not depend on their previous
-    # content
-    @test_trixi_include(joinpath(EXAMPLES_DIR, "elixir_advection_diffusion.jl"),
-                        tspan=(0.0, 0.0))
-    u_ode = compute_coefficients(0.0, semi)
-    du_first = similar(u_ode)
-    Trixi.rhs_macrocellfv!(du_first, u_ode, semi, 0.0)
-    for pads in (semi.cache.pad_x_threaded, semi.cache.pad_y_threaded)
-        foreach(pad -> fill!(pad, NaN), pads)
+        # The buffers of the threads are reused for all elements, and only the pad
+        # cells read by the reconstruction are filled (no corner subcells): the result
+        # does not depend on their previous content
+        for buffers in (semi.cache.pad_x_threaded, semi.cache.pad_y_threaded,
+                        semi.cache.pad_points_threaded, semi.cache.face_flux_threaded,
+                        semi.cache.face_flux_average_threaded)
+            foreach(buffer -> fill!(buffer, NaN), buffers)
+        end
+        foreach(buffers -> foreach(b -> fill!(b, NaN), buffers),
+                semi.cache.line_buffers_threaded)
+        du_nan = similar(u_ode)
+        Trixi.rhs_macrocellfv!(du_nan, u_ode, semi, 0.0)
+        @test du_nan == du_ode
     end
-    foreach(buffers -> foreach(b -> fill!(b, NaN), buffers),
-            semi.cache.line_buffers_threaded)
-    du_ode = similar(u_ode)
-    Trixi.rhs_macrocellfv!(du_ode, u_ode, semi, 0.0)
-    @test du_ode == du_first
 end
 
 @testitem "MacroCellFV 2D: unsupported setups" setup=[
@@ -181,4 +194,48 @@ end
                                                             initial_condition_convergence_test,
                                                             solver;
                                                             boundary_conditions = boundary_condition_periodic)
+end
+
+@testitem "MacroCellFV 2D: elixir_euler_vortex.jl" setup=[
+    Setup,
+    TreeMesh2DMacroCellFV
+] tags=[:tree_part1] begin
+    @test_trixi_include(joinpath(EXAMPLES_DIR, "elixir_euler_vortex.jl"),
+                        l2=[
+                            2.1581585701611975e-5,
+                            0.0009258993877840325,
+                            0.0009276994820451509,
+                            0.0026075664927432273
+                        ],
+                        linf=[
+                            0.0005215480067244371,
+                            0.01157819057217474,
+                            0.011544825439953915,
+                            0.05309742322436506
+                        ],
+                        tspan=(0.0, 0.2))
+    @test_allocations(Trixi.rhs_hyperbolic!, semi, sol, ALLOCATION_LIMIT)
+end
+
+@testitem "MacroCellFV 2D: elixir_euler_vortex.jl convergence" setup=[
+    Setup,
+    TreeMesh2DMacroCellFV
+] tags=[:tree_part1] begin
+    # Point values: fourth order for the nonlinear fluxes; the averages are only second
+    # order (not yet in the asymptotic range on these meshes, but much less accurate)
+    function vortex_errors(moment_inversion, center2recon, face2flux)
+        return map((3, 4)) do level
+            mod = Module()
+            trixi_include(mod, joinpath(EXAMPLES_DIR, "elixir_euler_vortex.jl");
+                          initial_refinement_level = level, tspan = (0.0, 0.5),
+                          moment_inversion, center2recon, face2flux,
+                          analysis_interval = 10^6)
+            subcell_average_error(mod)
+        end
+    end
+    errors_points = vortex_errors(MomentInversionCentral(order = 4), cons2prim,
+                                  prim2cons)
+    @test log2(errors_points[1] / errors_points[2]) > 3.7
+    errors_averages = vortex_errors(MomentInversionIdentity(), cons2cons, cons2cons)
+    @test errors_averages[2] > 3 * errors_points[2]
 end

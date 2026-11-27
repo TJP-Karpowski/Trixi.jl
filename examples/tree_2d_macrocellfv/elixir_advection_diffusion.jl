@@ -30,10 +30,15 @@ end
 # the diffusive fluxes are evaluated in one pass with the
 # `SemidiscretizationHyperbolicParabolic` below. The initial condition is set to the
 # subcell averages (Gauss-Legendre quadrature with 3 nodes per direction).
+# With `moment_inversion = MomentInversionCentral(order = 4)`, the stencils act on the
+# point values at the subcell centers instead, and the point fluxes at the face midpoints
+# are converted to face averages (fourth order, also for nonlinear fluxes).
 n_cells = 8
 reconstruction = CombinedScheme(ReconstructionWENO5Z(), GradientCentral(4))
+moment_inversion = MomentInversionIdentity()
 solver = MacroCellFV(n_cells = n_cells, surface_flux = flux_lax_friedrichs,
                      reconstruction = reconstruction,
+                     moment_inversion = moment_inversion,
                      initial_condition_nodes = 3)
 
 coordinates_min = (-1.0, -1.0)
